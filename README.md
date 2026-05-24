@@ -8,7 +8,7 @@
 
 - 扫描需要重新授权的 sub2api OAuth 账号
 - 支持按账号 ID、邮箱、分组、套餐筛选
-- 支持交互式选择单个账号或批量 `all` 连续处理
+- 支持交互式选择单个账号，或先按分组筛选后用 `all` 批量处理同一组账号
 - 自动打开浏览器完成登录、验证码输入和授权确认
 - 支持邮箱验证码从 Cloudflare 邮箱辅助页读取
 - 遇到账号被删除/停用时自动跳过并记录
@@ -106,6 +106,13 @@ node index.js --interactive
 - 邮箱
 - `all` 一次处理全部匹配账号
 
+如果想按分组分批处理，可以直接先加分组筛选，再在该组候选里输入 `all`：
+
+```powershell
+node index.js --interactive --group plus
+node index.js --interactive --group-id 1
+```
+
 ### 5. 常用筛选
 
 ```powershell
@@ -122,6 +129,7 @@ node index.js --auto --prefer-group-id 1
 - `--prefer-group` / `--prefer-group-id`：优先处理匹配账号，但不排除其他候选
 - `--plan`：按套餐过滤，支持 `free` / `plus`
 - `--confirm`：和 `--interactive` 等价
+- `--interactive` 配合 `--group` / `--group-id` 可按分组分批次选择账号
 
 ## 处理流程
 
@@ -145,4 +153,3 @@ node index.js --auto --prefer-group-id 1
 - 这是本地工具，建议先在测试账号上验证
 - `config.json`、`tokens/`、`data/` 不应提交到 GitHub
 - 如果账号被删除/停用，工具会跳过该账号继续后续流程
-
