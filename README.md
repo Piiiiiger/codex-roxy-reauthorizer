@@ -58,10 +58,6 @@ notepad config.json
 - `preferredGroupNames`
 - `preferredGroupIds`
 
-说明：
-
-- `config.json` 已加入 `.gitignore`，不要提交到 GitHub
-- `config.example.json` 可以直接作为模板上传
 
 ## 运行方式
 
@@ -150,6 +146,4 @@ node index.js --auto --prefer-group-id 1
 
 ## 注意事项
 
-- 这是本地工具，建议先在测试账号上验证
-- `config.json`、`tokens/`、`data/` 不应提交到 GitHub
 - 如果账号被删除/停用，工具会跳过该账号继续后续流程
