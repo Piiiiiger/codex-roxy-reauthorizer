@@ -30,6 +30,14 @@ const OTP_TEXTS = [
   '涓€娆℃€ч獙璇佺爜',
 ];
 
+const CHATGPT_LOGIN_TEXTS = [
+  'Log in',
+  'Login',
+  'Sign in',
+  '\u767b\u5f55',
+  '\u767b\u5165',
+];
+
 function textMatchesAny(value, candidates) {
   const text = String(value || '');
   const lower = text.toLowerCase();
@@ -842,6 +850,17 @@ class BrowserAuth {
     await this.waitForCloudflare(60000).catch(() => {});
     await sleep(5000);
 
+    const result = await this.readChatGptSessionFromCurrentPage();
+    if (!result.ok && !result.accessToken) {
+      throw new Error(`ChatGPT 会话接口失败：HTTP ${result.status || 'unknown'}`);
+    }
+    if (!result.accessToken) {
+      throw new Error('ChatGPT 会话中没有 accessToken');
+    }
+    return result;
+  }
+
+  async readChatGptSessionFromCurrentPage() {
     const result = await this.page.evaluate(async () => {
       const response = await fetch('/api/auth/session', { credentials: 'include' });
       const session = await response.json().catch(() => ({}));
@@ -853,13 +872,121 @@ class BrowserAuth {
       };
     });
 
-    if (!result.ok && !result.accessToken) {
-      throw new Error(`ChatGPT 会话接口失败：HTTP ${result.status || 'unknown'}`);
-    }
-    if (!result.accessToken) {
-      throw new Error('ChatGPT 会话中没有 accessToken');
-    }
     return result;
+  }
+
+  async tryReadChatGptSessionFromCurrentPage() {
+    try {
+      const url = new URL(this.page.url());
+      if (!/(^|\.)chatgpt\.com$/i.test(url.hostname)) return null;
+      const result = await this.readChatGptSessionFromCurrentPage();
+      return result?.accessToken ? result : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async loginChatGptWithEmailOtp({ email, mailProvider }) {
+    console.log(`[浏览器] 重新打开浏览器登录 ChatGPT：${email}`);
+    await this.page.goto('https://chatgpt.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await this.waitForCloudflare(60000).catch(() => {});
+    await sleep(3000);
+
+    let lastLoggedUrl = '';
+    let codeEntered = false;
+    for (let round = 0; round < 48; round += 1) {
+      await sleep(2500);
+
+      const sessionState = await this.tryReadChatGptSessionFromCurrentPage();
+      if (sessionState) {
+        console.log('[浏览器] 已获取 ChatGPT session access token');
+        return sessionState;
+      }
+
+      let pageInfo;
+      try {
+        pageInfo = await this.getPageInfo();
+      } catch {
+        continue;
+      }
+
+      if (this.isAccountDeactivatedPage(pageInfo)) {
+        await this.screenshot('chatgpt-account-deactivated.png');
+        throw new AccountDeactivatedError();
+      }
+      if (this.isAddPhonePage(pageInfo)) {
+        await this.screenshot('chatgpt-add-phone.png');
+        throw new AddPhoneRequiredError('ChatGPT 登录时要求进行手机号验证');
+      }
+
+      if (pageInfo.url !== lastLoggedUrl) {
+        console.log(`[浏览器] ChatGPT 登录第 ${round} 轮：${pageInfo.url.substring(0, 90)}`);
+        lastLoggedUrl = pageInfo.url;
+      }
+
+      const hasEmailInput = pageInfo.inputs.some((input) => input.type === 'email' || ['email', 'username', 'identifier'].includes(input.name));
+      if (hasEmailInput) {
+        console.log(`[浏览器] 输入 ChatGPT 邮箱：${email}`);
+        await this.fillInput([
+          'input[type="email"]',
+          'input[name="email"]',
+          'input[name="username"]',
+          'input[name="identifier"]',
+          'input[type="text"]',
+        ], email);
+        await this.page.keyboard.press('Enter').catch(() => {});
+        await sleep(1000);
+        await this.clickSubmitButton();
+        await this.waitForCloudflare(30000).catch(() => {});
+        continue;
+      }
+
+      const hasPassword = pageInfo.inputs.some((input) => input.type === 'password') || /password/i.test(pageInfo.url);
+      if (hasPassword) {
+        const clickedOtp = await this.clickByXPath('/html/body/div/div/fieldset/form/div[2]/div[3]/div/button')
+          || await this.clickByText(OTP_TEXTS, 5000);
+        if (!clickedOtp) {
+          throw new Error('ChatGPT 密码页已显示，但未找到一次性验证码登录入口');
+        }
+        codeEntered = false;
+        await sleep(1000);
+        await this.waitForCloudflare(30000).catch(() => {});
+        continue;
+      }
+
+      if (isCodePage(pageInfo) && !codeEntered) {
+        console.log('[浏览器] 等待 ChatGPT 邮箱验证码');
+        const code = await this.pollEmailCodeByBrowserPage(mailProvider, email, { limit: 20 });
+        await this.keepMainPageVisible();
+        await this.enterVerificationCode(code);
+        await this.waitForCloudflare(30000).catch(() => {});
+        codeEntered = true;
+        continue;
+      }
+
+      if (pageInfo.buttons.some((button) => textMatchesAny(button, EMAIL_LOGIN_TEXTS))) {
+        await this.clickByText(EMAIL_LOGIN_TEXTS, 5000);
+        continue;
+      }
+
+      if (pageInfo.buttons.some((button) => textMatchesAny(button, CHATGPT_LOGIN_TEXTS))) {
+        await this.clickByText(CHATGPT_LOGIN_TEXTS, 5000);
+        continue;
+      }
+
+      const clickedContinue = await this.clickByText(['Continue', '\u7ee7\u7eed'], 2000);
+      if (clickedContinue) {
+        await this.waitForCloudflare(30000).catch(() => {});
+        continue;
+      }
+
+      if (round % 6 === 5) {
+        await this.screenshot(`chatgpt-login-round-${round}.png`);
+        console.log(`[浏览器] ChatGPT 登录页面内容：${pageInfo.text.substring(0, 180)}`);
+      }
+    }
+
+    throw new Error('ChatGPT 重新登录并获取 access token 超时');
   }
 }
 

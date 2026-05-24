@@ -491,26 +491,37 @@ async function reauthorizeAccount(account, { client, mailProvider, config }) {
         return { skipped: true, reason: 'add_phone', logPath };
       }
 
-      console.warn('[重授权] Plus 账号遇到手机号验证，改用 ChatGPT session access token');
-      const sessionState = await browser.readChatGptSession();
-      const credentials = buildSessionAtCredentials({
-        account,
-        session: sessionState.session,
-        accessToken: sessionState.accessToken,
-        forcePlanType: 'plus',
-      });
-      const extra = buildUpdatedExtra(account.extra, {}, 'session_at');
-      const success = await updateSuccess({
-        client,
-        config,
-        account,
-        credentials,
-        extra,
-        result: 'success_session_at',
-        startedAt,
-      });
-      console.log(`[重授权] Plus session AT 已更新。token=${success.tokenWrite.savedPaths.join(' | ')}`);
-      return { ok: true, mode: 'session_at', ...success };
+      console.warn('[重授权] Plus 账号遇到手机号验证，关闭当前浏览器并重新登录 ChatGPT 获取 session access token');
+      await browser.close();
+
+      const sessionBrowser = new BrowserAuth(config);
+      await sessionBrowser.launch();
+      try {
+        const sessionState = await sessionBrowser.loginChatGptWithEmailOtp({
+          email,
+          mailProvider,
+        });
+        const credentials = buildSessionAtCredentials({
+          account,
+          session: sessionState.session,
+          accessToken: sessionState.accessToken,
+          forcePlanType: 'plus',
+        });
+        const extra = buildUpdatedExtra(account.extra, {}, 'session_at');
+        const success = await updateSuccess({
+          client,
+          config,
+          account,
+          credentials,
+          extra,
+          result: 'success_session_at',
+          startedAt,
+        });
+        console.log(`[重授权] Plus session AT 已更新。token=${success.tokenWrite.savedPaths.join(' | ')}`);
+        return { ok: true, mode: 'session_at', ...success };
+      } finally {
+        await sessionBrowser.close();
+      }
     }
 
     if (!authResult || authResult.status !== 'callback') {

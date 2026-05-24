@@ -13,7 +13,7 @@
 - 支持邮箱验证码从 Cloudflare 邮箱辅助页读取
 - 遇到账号被删除/停用时自动跳过并记录
 - 遇到免费账号要求绑定手机号时自动跳过
-- 遇到 Plus 账号手机号验证时改用 ChatGPT session access token
+- 遇到 Plus 账号手机号验证时关闭当前浏览器，重新打开浏览器登录 ChatGPT 并获取 session access token
 - 更新 sub2api 账号凭据、清理错误状态，并写入本地 token 文件和日志
 
 ## 环境要求
