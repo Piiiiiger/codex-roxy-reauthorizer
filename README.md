@@ -1,20 +1,39 @@
 # codex-openai-reauthorizer
 
-Independent OpenAI/Codex reauthorization tool for sub2api accounts.
+一个用于 sub2api 的 OpenAI / Codex 账号重新授权工具。
 
-It scans or selects one sub2api OpenAI OAuth account, opens the OpenAI OAuth URL in a real browser, logs in with email OTP from the configured Cloudflare mailbox service, exchanges the callback code through sub2api, updates the original account credentials with `PUT /api/v1/admin/accounts/:id`, clears the account error, writes a local token JSON, and appends a local reauth log.
+它会自动扫描需要重新授权的账号，打开真实浏览器完成 OpenAI 登录流程，读取邮箱验证码，处理授权回调，并把新的 OAuth 凭据回写到 sub2api，同时保存本地 token 和操作日志。
 
-For free accounts, if OpenAI asks to add a phone number, the account is skipped and logged. For plus accounts, the tool falls back to a session access-token export from `https://chatgpt.com/api/auth/session` and updates the original account with a no-refresh-token credential while preserving `plan_type: "plus"`.
+## 功能
 
-## Setup
+- 扫描需要重新授权的 sub2api OAuth 账号
+- 支持按账号 ID、邮箱、分组、套餐筛选
+- 支持交互式选择单个账号或批量 `all` 连续处理
+- 自动打开浏览器完成登录、验证码输入和授权确认
+- 支持邮箱验证码从 Cloudflare 邮箱辅助页读取
+- 遇到账号被删除/停用时自动跳过并记录
+- 遇到免费账号要求绑定手机号时自动跳过
+- 遇到 Plus 账号手机号验证时改用 ChatGPT session access token
+- 更新 sub2api 账号凭据、清理错误状态，并写入本地 token 文件和日志
+
+## 环境要求
+
+- Node.js 18+
+- Chrome 或 Edge
+- 可访问的 sub2api 管理接口
+- 可访问的邮箱服务辅助页
+
+## 安装
 
 ```powershell
 npm install
-Copy-Item config.example.json config.json
+copy config.example.json config.json
 notepad config.json
 ```
 
-Required config:
+## 配置
+
+编辑 `config.json`，至少填写这些项：
 
 - `sub2apiBaseUrl`
 - `sub2apiAdminEmail`
@@ -22,61 +41,108 @@ Required config:
 - `mailBaseUrl`
 - `mailAdminPassword`
 
-`mailDomain` is optional. Leave it empty when your Cloudflare mailbox admin can query multiple domains; the tool will query mails by full email address through admin endpoints first.
+可选项：
 
-## Usage
+- `mailSitePassword`
+- `mailDomain`
+- `mailTimeoutMs`
+- `oauthRedirectUri`
+- `tokenOutputDirs`
+- `tokenFilenameMode`
+- `reauthLogFile`
+- `browserWindowWidth`
+- `browserWindowHeight`
+- `chromePath`
+- `edgePath`
+- `candidateErrorKeywords`
+- `preferredGroupNames`
+- `preferredGroupIds`
 
-Run a specific account:
+说明：
 
-```powershell
-node index.js --account-id 123
-```
+- `config.json` 已加入 `.gitignore`，不要提交到 GitHub
+- `config.example.json` 可以直接作为模板上传
 
-Run by email:
+## 运行方式
 
-```powershell
-node index.js --email user@example.com
-```
-
-Auto-pick the first matching candidate:
-
-```powershell
-node index.js --auto
-```
-
-List candidates only:
+### 1. 扫描候选账号
 
 ```powershell
 node index.js --list-candidates
 ```
 
-Interactive scan and confirm before starting:
+### 2. 处理单个账号
+
+按 ID：
+
+```powershell
+node index.js --account-id 123
+```
+
+按邮箱：
+
+```powershell
+node index.js --email user@example.com
+```
+
+### 3. 自动处理第一个匹配账号
+
+```powershell
+node index.js --auto
+```
+
+### 4. 交互式处理
+
+先扫描，再手动确认：
 
 ```powershell
 node index.js --interactive
 ```
 
-You can also combine it with filters:
+在候选列表里可以输入：
+
+- 序号
+- 账号 ID
+- 邮箱
+- `all` 一次处理全部匹配账号
+
+### 5. 常用筛选
 
 ```powershell
 node index.js --interactive --group plus
-node index.js --interactive --email user@example.com
-```
-
-Useful filters:
-
-```powershell
-node index.js --auto --group plus --plan plus
+node index.js --interactive --plan free
 node index.js --auto --group-id 1
 node index.js --auto --prefer-group plus
 node index.js --auto --prefer-group-id 1
 ```
 
-`--group` and `--group-id` filter candidates strictly. `--prefer-group` and `--prefer-group-id` only change priority: matching accounts are tried first, and other matching candidates remain available.
+参数说明：
 
-## Notes
+- `--group` / `--group-id`：严格过滤候选账号
+- `--prefer-group` / `--prefer-group-id`：优先处理匹配账号，但不排除其他候选
+- `--plan`：按套餐过滤，支持 `free` / `plus`
+- `--confirm`：和 `--interactive` 等价
 
-- The original sub2api account name, groups, proxy, concurrency, priority, and extra data are preserved on update.
-- The account's own `proxy_id` is reused for generate-auth-url and exchange-code.
-- The local token filename defaults to plan-aware mode: `codex-{email}-{plan_type}.json`.
-- Set `tokenFilenameMode` to `legacy-free` if you need the old `codex-{email}-free.json` filename.
+## 处理流程
+
+1. 扫描 sub2api 中符合条件的 OAuth 账号
+2. 打开浏览器进入 OpenAI 登录页
+3. 输入邮箱并继续
+4. 如遇密码页，点击“一次性验证码登录”
+5. 从邮箱辅助页读取验证码并填入
+6. 完成授权确认
+7. 获取回调地址中的授权码并兑换凭据
+8. 更新 sub2api 账号状态和凭据
+9. 写入本地 token 文件和 reauth 日志
+
+## 输出文件
+
+- `tokens/`：本地 token 文件
+- `data/reauth-log.json`：重新授权日志
+
+## 注意事项
+
+- 这是本地工具，建议先在测试账号上验证
+- `config.json`、`tokens/`、`data/` 不应提交到 GitHub
+- 如果账号被删除/停用，工具会跳过该账号继续后续流程
+
