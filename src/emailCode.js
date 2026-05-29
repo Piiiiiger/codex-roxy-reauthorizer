@@ -25,6 +25,8 @@ function collectTextCandidates(input) {
       input?.subject,
       input?.title,
       input?.preview,
+      input?.body_preview,
+      input?.bodyPreview,
       input?.snippet,
       input?.summary,
       input?.headers?.subject,

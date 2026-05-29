@@ -107,6 +107,7 @@ function normalizeMailsFromPayload(payload) {
   if (Array.isArray(payload)) return payload;
   if (Array.isArray(payload.results)) return payload.results;
   if (Array.isArray(payload.mails)) return payload.mails;
+  if (Array.isArray(payload.emails)) return payload.emails;
   if (Array.isArray(payload.items)) return payload.items;
   if (Array.isArray(payload.list)) return payload.list;
   if (Array.isArray(payload.records)) return payload.records;
@@ -114,6 +115,7 @@ function normalizeMailsFromPayload(payload) {
     if (Array.isArray(payload.data)) return payload.data;
     if (Array.isArray(payload.data.results)) return payload.data.results;
     if (Array.isArray(payload.data.mails)) return payload.data.mails;
+    if (Array.isArray(payload.data.emails)) return payload.data.emails;
     if (Array.isArray(payload.data.items)) return payload.data.items;
     if (Array.isArray(payload.data.list)) return payload.data.list;
     if (Array.isArray(payload.data.records)) return payload.data.records;
@@ -266,6 +268,7 @@ class BrowserAuth {
     const result = await mailboxPage.evaluate(async (params) => {
       const headers = { 'Content-Type': 'application/json' };
       if (params.adminPassword) headers['x-admin-auth'] = params.adminPassword;
+      if (params.adminPassword) headers['X-API-Key'] = params.adminPassword;
       if (params.sitePassword) headers['x-custom-auth'] = params.sitePassword;
 
       const withQuery = (url, query) => {
@@ -327,6 +330,8 @@ class BrowserAuth {
         { method: 'GET', url: '/admin/get_mails', params: { address: params.email, limit: params.limit, offset: params.offset } },
         { method: 'GET', url: '/api/mails', params: { address: params.email, limit: params.limit, offset: params.offset } },
         { method: 'GET', url: '/api/mails', params: { email: params.email, limit: params.limit, offset: params.offset } },
+        { method: 'GET', url: '/api/external/emails', params: { email: params.email, top: params.limit, skip: params.offset, folder: 'inbox', include_body: '1', preferred_method: 'imap' } },
+        { method: 'GET', url: '/api/external/emails', params: { email: params.email, top: params.limit, skip: params.offset, folder: 'junkemail', include_body: '1', preferred_method: 'imap' } },
       ];
 
       const attempts = [];
@@ -995,4 +1000,3 @@ module.exports = {
   AddPhoneRequiredError,
   AccountDeactivatedError,
 };
-

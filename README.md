@@ -61,6 +61,28 @@ notepad config.json
 
 ## 运行方式
 
+### 可视化插件面板
+
+这个工具可以作为外部插件服务运行，不需要修改官方 sub2api 仓库。
+
+```bash
+npm install
+npm run plugin
+```
+
+插件服务默认地址：
+
+```text
+http://127.0.0.1:8765
+```
+
+有两种接入方式：
+
+- 通过外部安全网关注入：在 `sub2api-security-gateway` 中开启 `SG_REAUTH_PLUGIN_ENABLED=true`，然后打开网关入口 `http://127.0.0.1:8317`
+- 通过浏览器 userscript：打开 `http://127.0.0.1:8765/sub2api-reauthorizer.user.js` 安装脚本后，再打开 sub2api 页面
+
+面板会显示在 sub2api 页面右侧，包含候选账号扫描、单个/批量重授权、任务日志和配置页。插件配置保存在本项目的 `config.json`，不会写入 sub2api 官方仓库。
+
 ### 1. 扫描候选账号
 
 ```powershell

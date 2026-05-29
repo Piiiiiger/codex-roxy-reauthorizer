@@ -635,4 +635,10 @@ module.exports = {
   main,
   findCandidates,
   reauthorizeAccount,
+  processAccountsQueue,
+  getEmail,
+  getPlanType,
+  getGroupNames,
+  formatCandidateLine,
+  isOpenAiOauthAccount,
 };

@@ -22,6 +22,15 @@
   "chromePath": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   "useEdge": false,
   "edgePath": "",
+  "pluginHost": "127.0.0.1",
+  "pluginPort": 8765,
+  "pluginAccessToken": "",
+  "pluginAllowedOrigins": [
+    "http://127.0.0.1:8317",
+    "http://127.0.0.1:8319",
+    "http://localhost:8317",
+    "http://localhost:8319"
+  ],
   "candidateErrorKeywords": [
     "invalid_grant",
     "Token refresh failed",

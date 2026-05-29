@@ -7,7 +7,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check src/cli.js && node --check src/config.js && node --check src/sub2apiClient.js && node --check src/mailProvider.js && node --check src/emailCode.js && node --check src/browserAuth.js && node --check src/sessionCredentials.js && node --check src/tokenWriter.js && node --check src/reauthLog.js"
+    "plugin": "node index.js --plugin-server",
+    "check": "node --check index.js && node --check src/cli.js && node --check src/config.js && node --check src/sub2apiClient.js && node --check src/mailProvider.js && node --check src/emailCode.js && node --check src/browserAuth.js && node --check src/sessionCredentials.js && node --check src/tokenWriter.js && node --check src/reauthLog.js && node --check src/pluginServer.js && node --check public/sub2api-reauthorizer.user.js"
   },
   "dependencies": {
     "axios": "^1.13.6",

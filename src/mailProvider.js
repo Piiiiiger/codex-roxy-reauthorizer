@@ -20,6 +20,7 @@ class MailProvider {
       'Content-Type': 'application/json',
       'x-admin-auth': this.adminPassword,
     };
+    if (this.adminPassword) headers['X-API-Key'] = this.adminPassword;
     if (this.sitePassword) headers['x-custom-auth'] = this.sitePassword;
     return headers;
   }
@@ -52,10 +53,12 @@ class MailProvider {
     if (Array.isArray(payload)) return payload;
     if (Array.isArray(payload.results)) return payload.results;
     if (Array.isArray(payload.mails)) return payload.mails;
+    if (Array.isArray(payload.emails)) return payload.emails;
     if (payload.data) {
       if (Array.isArray(payload.data)) return payload.data;
       if (Array.isArray(payload.data.results)) return payload.data.results;
       if (Array.isArray(payload.data.mails)) return payload.data.mails;
+      if (Array.isArray(payload.data.emails)) return payload.data.emails;
     }
     return null;
   }
@@ -191,6 +194,30 @@ class MailProvider {
       { method: 'get', url: '/admin/get_mails', params: { address, limit, offset } },
       { method: 'get', url: '/api/mails', params: { address, limit, offset } },
       { method: 'get', url: '/api/mails', params: { email: address, limit, offset } },
+      {
+        method: 'get',
+        url: '/api/external/emails',
+        params: {
+          email: address,
+          top: limit,
+          skip: offset,
+          folder: 'inbox',
+          include_body: '1',
+          preferred_method: 'imap',
+        },
+      },
+      {
+        method: 'get',
+        url: '/api/external/emails',
+        params: {
+          email: address,
+          top: limit,
+          skip: offset,
+          folder: 'junkemail',
+          include_body: '1',
+          preferred_method: 'imap',
+        },
+      },
     ];
 
     let lastError = null;

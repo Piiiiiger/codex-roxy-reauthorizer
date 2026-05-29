@@ -65,6 +65,11 @@ function loadConfig() {
     useEdge: raw.useEdge === true,
     edgePath: String(envOrConfig('EDGE_PATH', raw, 'edgePath', '')),
 
+    pluginHost: String(envOrConfig('PLUGIN_HOST', raw, 'pluginHost', '127.0.0.1')),
+    pluginPort: toInt(envOrConfig('PLUGIN_PORT', raw, 'pluginPort', 8765), 8765),
+    pluginAccessToken: String(envOrConfig('PLUGIN_ACCESS_TOKEN', raw, 'pluginAccessToken', '')),
+    pluginAllowedOrigins: toArray(envOrConfig('PLUGIN_ALLOWED_ORIGINS', raw, 'pluginAllowedOrigins', [])),
+
     candidateErrorKeywords: candidateErrorKeywords.length ? candidateErrorKeywords : [
       'invalid_grant',
       'Token refresh failed',
