@@ -1,25 +1,29 @@
 // ==UserScript==
 // @name         Sub2API OpenAI Reauthorizer Panel
 // @namespace    https://github.com/Piiiiiger/codex-roxy-reauthorizer
-// @version      0.1.0
+// @version      0.1.7
 // @description  Inject an OpenAI reauthorization panel into the Sub2API admin UI.
 // @match        http://127.0.0.1:8317/*
 // @match        http://127.0.0.1:8319/*
 // @match        http://localhost:8317/*
 // @match        http://localhost:8319/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
 // @connect      127.0.0.1
 // @connect      localhost
+// @connect      *
 // ==/UserScript==
 
 (function () {
   'use strict';
 
   const DEFAULT_BASE_URL = __PLUGIN_BASE_URL__;
+  const DEFAULT_BASE_URLS = __PLUGIN_BASE_URLS__;
+  const SAME_ORIGIN_BASE_URL = `${window.location.origin}/_reauth_plugin`;
   const DEFAULT_TOKEN = __PLUGIN_ACCESS_TOKEN__;
   const STORAGE_PREFIX = 'sub2apiReauthPlugin.';
   const state = {
-    baseUrl: localStorage.getItem(`${STORAGE_PREFIX}baseUrl`) || DEFAULT_BASE_URL,
+    baseUrl: localStorage.getItem(`${STORAGE_PREFIX}baseUrl`) || SAME_ORIGIN_BASE_URL || DEFAULT_BASE_URL,
     token: localStorage.getItem(`${STORAGE_PREFIX}token`) || DEFAULT_TOKEN,
     open: localStorage.getItem(`${STORAGE_PREFIX}open`) === '1',
     activeTab: localStorage.getItem(`${STORAGE_PREFIX}tab`) || 'scan',
@@ -42,6 +46,9 @@
     message: '',
     error: '',
     pollTimer: null,
+    bodyScrollTop: 0,
+    logScrollTop: 0,
+    logFollow: true,
   };
 
   const css = `
@@ -163,12 +170,29 @@
       margin-bottom: 10px;
       color: #29343d;
     }
+    .s2r-section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .s2r-section-head .s2r-section-title { margin-bottom: 0; }
     .s2r-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 8px;
     }
     .s2r-field { min-width: 0; }
+    .s2r-check-field {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 32px;
+      padding-top: 18px;
+    }
+    .s2r-check-field input { margin: 0; }
     .s2r-label {
       display: block;
       color: #53616f;
@@ -291,6 +315,57 @@
     return node;
   }
 
+  function isScrolledToBottom(node) {
+    if (!node) return true;
+    return node.scrollTop + node.clientHeight >= node.scrollHeight - 16;
+  }
+
+  function captureScrollState() {
+    const body = document.querySelector('#s2r-root .s2r-body');
+    if (body) state.bodyScrollTop = body.scrollTop;
+
+    const log = document.querySelector('#s2r-root .s2r-log');
+    if (log) {
+      state.logScrollTop = log.scrollTop;
+      state.logFollow = isScrolledToBottom(log);
+    }
+  }
+
+  function restoreScrollState() {
+    if (!state.open) return;
+    requestAnimationFrame(() => {
+      const body = document.querySelector('#s2r-root .s2r-body');
+      if (body) body.scrollTop = state.bodyScrollTop;
+
+      const log = document.querySelector('#s2r-root .s2r-log');
+      if (!log) return;
+      if (state.logFollow) {
+        log.scrollTop = log.scrollHeight;
+      } else {
+        log.scrollTop = Math.min(state.logScrollTop, log.scrollHeight);
+      }
+    });
+  }
+
+  function rememberBodyScroll(event) {
+    state.bodyScrollTop = event.currentTarget.scrollTop;
+  }
+
+  function rememberLogScroll(event) {
+    const node = event.currentTarget;
+    state.logScrollTop = node.scrollTop;
+    state.logFollow = isScrolledToBottom(node);
+  }
+
+  function scrollLogToBottom() {
+    state.logFollow = true;
+    const log = document.querySelector('#s2r-root .s2r-log');
+    if (log) {
+      log.scrollTop = log.scrollHeight;
+      state.logScrollTop = log.scrollTop;
+    }
+  }
+
   function setBusy(value) {
     state.busy = value;
     render();
@@ -313,45 +388,94 @@
     return `${state.baseUrl.replace(/\/+$/, '')}${path}`;
   }
 
-  function apiRequest(path, options = {}) {
+  function apiUrls(path) {
+    const configuredBases = Array.isArray(DEFAULT_BASE_URLS) && DEFAULT_BASE_URLS.length
+      ? DEFAULT_BASE_URLS
+      : [DEFAULT_BASE_URL];
+    const mirrorLocalHosts = (base) => {
+      const value = String(base || '');
+      return [
+        value,
+        value.includes('127.0.0.1') ? value.replace('127.0.0.1', 'localhost') : '',
+        value.includes('localhost') ? value.replace('localhost', '127.0.0.1') : '',
+      ];
+    };
+    const bases = [
+      SAME_ORIGIN_BASE_URL,
+      state.baseUrl,
+      ...configuredBases,
+      ...mirrorLocalHosts(state.baseUrl),
+      ...configuredBases.flatMap(mirrorLocalHosts),
+    ]
+      .map((base) => String(base || '').replace(/\/+$/, ''))
+      .filter(Boolean);
+    return Array.from(new Set(bases)).map((base) => ({ base, url: `${base}${path}` }));
+  }
+
+  function xhrRequest(requestFn, request) {
+    return new Promise((resolve, reject) => {
+      requestFn({
+        ...request,
+        responseType: 'json',
+        onload: (response) => {
+          const payload = response.response || tryParseJson(response.responseText);
+          if (response.status >= 200 && response.status < 300) resolve(payload);
+          else {
+            const error = new Error(payload?.error || `HTTP ${response.status}`);
+            error.httpStatus = response.status;
+            reject(error);
+          }
+        },
+        onerror: () => reject(new Error('插件服务连接失败')),
+        ontimeout: () => reject(new Error('插件服务请求超时')),
+      });
+    });
+  }
+
+  async function apiRequest(path, options = {}) {
     const method = options.method || 'GET';
     const headers = {
       'Content-Type': 'application/json',
       ...(state.token ? { Authorization: `Bearer ${state.token}` } : {}),
     };
     const body = options.body ? JSON.stringify(options.body) : undefined;
-    const url = apiUrl(path);
+    const requestFn = typeof GM_xmlhttpRequest === 'function'
+      ? GM_xmlhttpRequest
+      : (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function' ? GM.xmlHttpRequest.bind(GM) : null);
+    let lastError = null;
 
-    if (typeof GM_xmlhttpRequest === 'function') {
-      return new Promise((resolve, reject) => {
-        GM_xmlhttpRequest({
-          method,
-          url,
-          headers,
-          data: body,
-          responseType: 'json',
-          onload: (response) => {
-            const payload = response.response || tryParseJson(response.responseText);
-            if (response.status >= 200 && response.status < 300) resolve(payload);
-            else reject(new Error(payload?.error || `HTTP ${response.status}`));
-          },
-          onerror: () => reject(new Error('插件服务连接失败')),
-          ontimeout: () => reject(new Error('插件服务请求超时')),
-          timeout: options.timeout || 60000,
-        });
-      });
+    for (const candidate of apiUrls(path)) {
+      try {
+        const payload = requestFn
+          ? await xhrRequest(requestFn, {
+            method,
+            url: candidate.url,
+            headers,
+            data: body,
+            timeout: options.timeout || 60000,
+          })
+          : await fetch(candidate.url, { method, headers, body }).then(async (response) => {
+            const text = await response.text();
+            const payload = tryParseJson(text);
+            if (!response.ok) {
+              const error = new Error(payload?.error || `HTTP ${response.status}`);
+              error.httpStatus = response.status;
+              throw error;
+            }
+            return payload;
+          });
+        if (candidate.base !== state.baseUrl.replace(/\/+$/, '')) {
+          state.baseUrl = candidate.base;
+          localStorage.setItem(`${STORAGE_PREFIX}baseUrl`, state.baseUrl);
+        }
+        return payload;
+      } catch (error) {
+        lastError = error;
+        if (error?.httpStatus) throw error;
+      }
     }
 
-    return fetch(url, {
-      method,
-      headers,
-      body,
-    }).then(async (response) => {
-      const text = await response.text();
-      const payload = tryParseJson(text);
-      if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
-      return payload;
-    });
+    throw new Error(`${lastError?.message || '插件服务连接失败'}。已尝试 127.0.0.1 和 localhost，请确认脚本管理器已更新到最新版 userscript。`);
   }
 
   function tryParseJson(value) {
@@ -377,6 +501,10 @@
 
   function checkedIds() {
     return Array.from(state.selectedIds).filter(Boolean);
+  }
+
+  function isJobRunning(job) {
+    return job && ['queued', 'running'].includes(String(job.status || ''));
   }
 
   async function refreshStatus(silent = false) {
@@ -470,6 +598,24 @@
       state.activeTab = 'jobs';
       state.activeJob = data.job || null;
       setMessage(`任务已创建：${state.activeJob?.id || ''}`);
+      startPolling();
+    } catch (error) {
+      setMessage('', error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelJob(id) {
+    if (!id) return;
+    setBusy(true);
+    try {
+      const data = await apiRequest(`/api/jobs/${encodeURIComponent(id)}/cancel`, {
+        method: 'POST',
+        body: { reason: '用户停止任务' },
+      });
+      state.activeJob = data.job || state.activeJob;
+      setMessage(`已发送停止请求：#${id}`);
       startPolling();
     } catch (error) {
       setMessage('', error.message);
@@ -651,10 +797,14 @@
         el('div', { class: 's2r-actions' }, [
           button('刷新任务', () => refreshJobs(false)),
           button('刷新日志', loadLogs),
+          job ? button('停止任务', () => cancelJob(job.id), isJobRunning(job), 'danger') : null,
         ]),
       ]),
       el('div', { class: 's2r-section' }, [
-        el('div', { class: 's2r-section-title', text: '输出' }),
+        el('div', { class: 's2r-section-head' }, [
+          el('div', { class: 's2r-section-title', text: '输出' }),
+          button('到底部', scrollLogToBottom),
+        ]),
         logBox(logs),
       ]),
       job?.results?.length ? el('div', { class: 's2r-section' }, [
@@ -679,7 +829,7 @@
     const content = logs.length
       ? logs.map((line) => `[${line.time || ''}] ${line.level || 'info'} ${line.message || ''}`).join('\n')
       : '暂无输出';
-    return el('div', { class: 's2r-log', text: content });
+    return el('div', { class: 's2r-log', text: content, onscroll: rememberLogScroll });
   }
 
   function logsView() {
@@ -718,6 +868,11 @@
       return Array.isArray(value) ? value.join(',') : String(value ?? '');
     }
     return String(item ?? '');
+  }
+
+  function configBool(key) {
+    const value = configValue(key).toLowerCase();
+    return value === 'true' || value === '1' || value === 'yes' || value === 'on';
   }
 
   function secretConfigured(key) {
@@ -763,7 +918,19 @@
       configField(secretConfigured('mailSitePassword') ? '邮箱站点密码 已设置' : '邮箱站点密码', 'mailSitePassword', 'password'),
       configField('邮箱域名', 'mailDomain'),
       configField('OAuth 回调', 'oauthRedirectUri'),
+      configSelectField('授权浏览器', 'browserEngine', [
+        ['camoufox', 'Camoufox 隐私浏览器'],
+        ['chrome', 'Chrome/Puppeteer'],
+      ]),
+      configCheckboxField('Camoufox 失败回退 Chrome', 'browserEngineFallbackToChrome'),
       configField('浏览器路径', 'chromePath'),
+      configField('浏览器资料目录', 'browserUserDataDir'),
+      configField(secretConfigured('browserProxyUrl') ? '浏览器授权代理 已设置，支持 {sid}' : '浏览器授权代理，支持 {sid}', 'browserProxyUrl', 'password'),
+      configField('链式代理第一跳', 'browserProxyChainFirst'),
+      configField('链式代理程序', 'browserProxyChainBinary'),
+      configField('链式代理监听地址', 'browserProxyChainListenHost'),
+      configField('链式代理启动超时 ms', 'browserProxyChainStartupTimeoutMs'),
+      configField('OAuth 最大重启次数', 'browserOAuthMaxRestarts'),
       configField('输出目录', 'tokenOutputDirs'),
       configField(secretConfigured('pluginAccessToken') ? '插件 Token 已设置' : '插件 Token', 'pluginAccessToken', 'password'),
       configField('允许页面 Origin', 'pluginAllowedOrigins'),
@@ -779,6 +946,29 @@
         'data-config-key': key,
         value: type === 'password' ? '' : configValue(key),
       }),
+    ]);
+  }
+
+  function configSelectField(label, key, options) {
+    const selected = configValue(key);
+    return el('label', { class: 's2r-field' }, [
+      el('span', { class: 's2r-label', text: label }),
+      el('select', { class: 's2r-select', 'data-config-key': key }, options.map(([value, text]) => el('option', {
+        value,
+        text,
+        selected: String(value) === String(selected) ? 'selected' : null,
+      }))),
+    ]);
+  }
+
+  function configCheckboxField(label, key) {
+    return el('label', { class: 's2r-check-field' }, [
+      el('input', {
+        type: 'checkbox',
+        'data-config-key': key,
+        checked: configBool(key) ? 'checked' : null,
+      }),
+      el('span', { text: label }),
     ]);
   }
 
@@ -866,7 +1056,7 @@
         tabButton('config', '配置'),
         tabButton('logs', '日志'),
       ]),
-      el('div', { class: 's2r-body' }, [
+      el('div', { class: 's2r-body', onscroll: rememberBodyScroll }, [
         ...messageNodes(),
         ...bodyContent(),
       ]),
@@ -879,6 +1069,7 @@
       root = el('div', { id: 's2r-root' });
       document.body.appendChild(root);
     }
+    captureScrollState();
     root.innerHTML = '';
     root.appendChild(state.open
       ? renderPanel()
@@ -893,6 +1084,7 @@
           render();
         },
       }));
+    restoreScrollState();
   }
 
   function installStyle() {

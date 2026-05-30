@@ -1,4 +1,5 @@
 const axios = require('axios');
+const { throwIfAborted } = require('./cancel');
 
 function isPlainObject(value) {
   return value && typeof value === 'object' && !Array.isArray(value);
@@ -48,6 +49,7 @@ class Sub2ApiClient {
     this.accessToken = String(options.accessToken || '');
     this.refreshToken = String(options.refreshToken || '');
     this.expiresAt = Number(options.expiresAt || 0);
+    this.signal = options.signal || null;
     this.loginPromise = null;
     if (!this.baseUrl) throw new Error('sub2apiBaseUrl is required');
     if (!this.adminEmail) throw new Error('sub2apiAdminEmail is required');
@@ -72,6 +74,7 @@ class Sub2ApiClient {
   }
 
   async login() {
+    throwIfAborted(this.signal);
     if (this.loginPromise) return this.loginPromise;
 
     this.loginPromise = (async () => {
@@ -84,6 +87,7 @@ class Sub2ApiClient {
           turnstile_token: this.turnstileToken || undefined,
         },
         timeout: this.timeoutMs,
+        signal: this.signal || undefined,
         headers: {
           'Content-Type': 'application/json',
         },
@@ -113,6 +117,7 @@ class Sub2ApiClient {
   }
 
   async refreshAccessToken() {
+    throwIfAborted(this.signal);
     if (!this.refreshToken) {
       return this.login();
     }
@@ -124,6 +129,7 @@ class Sub2ApiClient {
         refresh_token: this.refreshToken,
       },
       timeout: this.timeoutMs,
+      signal: this.signal || undefined,
       headers: {
         'Content-Type': 'application/json',
       },
@@ -141,6 +147,8 @@ class Sub2ApiClient {
   }
 
   async request(method, path, options = {}) {
+    const signal = options.signal || this.signal || null;
+    throwIfAborted(signal);
     if (!this.accessToken || this.isAccessTokenExpired(30 * 1000)) {
       try {
         await this.refreshAccessToken();
@@ -155,6 +163,7 @@ class Sub2ApiClient {
       params: options.params,
       data: options.body,
       timeout: options.timeoutMs || this.timeoutMs,
+      signal: signal || undefined,
       headers: this.buildHeaders(options.headers),
     });
 
@@ -171,6 +180,7 @@ class Sub2ApiClient {
     } catch (error) {
       const status = error?.response?.status;
       if (status === 401) {
+        throwIfAborted(signal);
         try {
           await this.refreshAccessToken();
         } catch {

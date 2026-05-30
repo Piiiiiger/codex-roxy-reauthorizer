@@ -39,7 +39,7 @@ notepad config.json
 - `sub2apiAdminEmail`
 - `sub2apiAdminPassword`
 - `mailBaseUrl`
-- `mailAdminPassword`
+- `mailAdminPassword`，如果 `mailBaseUrl` 使用令牌取件页则可不填
 
 可选项：
 
@@ -52,11 +52,32 @@ notepad config.json
 - `reauthLogFile`
 - `browserWindowWidth`
 - `browserWindowHeight`
+- `browserEngine`：默认 `camoufox`，使用 Camoufox 隐私浏览器；也可设为 `chrome` 走旧的 Chrome/Puppeteer
+- `browserEngineFallbackToChrome`：默认 `false`，Camoufox 启动失败时不自动回退 Chrome
+- `browserUserDataDir`
+- `browserProxyUrl`
 - `chromePath`
 - `edgePath`
 - `candidateErrorKeywords`
 - `preferredGroupNames`
 - `preferredGroupIds`
+
+邮箱验证码：
+
+- 插件默认通过 `mailBaseUrl` 配置的 Email 服务 API 读取验证码，不依赖授权浏览器的 localStorage。
+- 如果本机运行 `/home/pigger/code/Email`，推荐把 `mailBaseUrl` 配成 `http://127.0.0.1:5000`，并配置 `mailAdminPassword` 为该服务的对外 API Key。
+- `https://.../token` 这类取件页只适合人工查看和导入邮箱令牌，不建议作为自动授权的数据源。
+
+浏览器授权代理：
+
+- 插件默认使用 Camoufox，不再默认打开普通 Chrome。Camoufox 资料目录默认是 `data/camoufox-profile`，和旧 Chrome profile 分开。
+- `browserProxyUrl` 用于插件打开的授权浏览器，影响该浏览器访问 `auth.openai.com`、`chatgpt.com` 和邮箱取件页的网络。
+- 支持 `host:port`、`http://user:pass@host:port`、`socks5://host:port` 这类格式。
+- 需要每个账号更换 sticky session 时，可以在代理用户名里写 `{sid}`，插件会在每次处理账号前替换成新的随机值。
+- `browserProxyChainFirst` 用于启用浏览器链式代理。启用后流程为：Chrome -> 临时本地端口 -> `browserProxyChainFirst` -> `browserProxyUrl`。
+- 如果要复用 sub2api 的 Cliproxy 链式代理方式，可以把 `browserProxyChainFirst` 设置为 Clash Verge 的 HTTP 代理地址，例如 `http://127.0.0.1:7901`，再把 `browserProxyUrl` 设置为 Cliproxy 第二跳。
+- `browserProxyChainBinary` 默认使用 `/home/pigger/.config/sub2api/cliproxy_chain_proxy`。插件会在每个账号授权前启动独立的临时链式代理，授权结束后关闭。
+- sub2api 后端生成授权链接和换取 token 仍会使用账号自身的 `proxy_id`。
 
 
 ## 运行方式

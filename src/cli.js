@@ -1,10 +1,18 @@
 const { loadConfig } = require('./config');
 const { Sub2ApiClient } = require('./sub2apiClient');
 const { MailProvider } = require('./mailProvider');
-const { BrowserAuth, AddPhoneRequiredError, AccountDeactivatedError } = require('./browserAuth');
+const {
+  BrowserAuth,
+  AddPhoneRequiredError,
+  AccountDeactivatedError,
+  OAuthBrowserRestartRequiredError,
+} = require('./browserAuth');
 const { mergeOAuthCredentials, buildSessionAtCredentials, buildUpdatedExtra } = require('./sessionCredentials');
 const { writeTokenFiles } = require('./tokenWriter');
 const { appendReauthLog } = require('./reauthLog');
+const { isBrowserProxyChainEnabled, startBrowserProxyChain } = require('./browserProxyChain');
+const { addAbortListener, isCancelError, throwIfAborted } = require('./cancel');
+const crypto = require('node:crypto');
 const readline = require('node:readline/promises');
 
 function getArgValue(args, name) {
@@ -46,7 +54,40 @@ function getPlanType(account) {
 }
 
 function getEmail(account) {
-  return String(account?.credentials?.email || account?.email || '').trim();
+  const direct = String(account?.credentials?.email || account?.email || '').trim();
+  if (direct) return direct;
+
+  const name = String(account?.name || '');
+  const match = name.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return match ? match[0] : '';
+}
+
+function createProxySid() {
+  return crypto.randomBytes(6).toString('hex');
+}
+
+function buildBrowserConfigForAccount(config, account) {
+  const browserProxyUrl = String(config.browserProxyUrl || '');
+  if (!browserProxyUrl) return config;
+
+  const sid = createProxySid();
+  const email = getEmail(account);
+  const replacements = {
+    sid,
+    SID: sid,
+    accountId: String(account?.id || ''),
+    email: encodeURIComponent(email),
+  };
+  const resolvedProxyUrl = browserProxyUrl.replace(/\{\{?(sid|SID|accountId|email)\}?\}/g, (match, key) => replacements[key] ?? match);
+
+  if (resolvedProxyUrl !== browserProxyUrl) {
+    console.log(`[重授权] 浏览器授权代理已为当前账号生成 sid=${sid}`);
+  }
+
+  return {
+    ...config,
+    browserProxyUrl: resolvedProxyUrl,
+  };
 }
 
 function isOpenAiOauthAccount(account) {
@@ -379,6 +420,20 @@ function logSkippedReauth(account, config, startedAt, error) {
   return { skipped: true, reason, logPath };
 }
 
+function isAddPhoneRequiredError(error) {
+  return error instanceof AddPhoneRequiredError || error?.code === 'ADD_PHONE_REQUIRED';
+}
+
+function isOAuthBrowserRestartRequired(error) {
+  return error instanceof OAuthBrowserRestartRequiredError || error?.code === 'OAUTH_BROWSER_RESTART_REQUIRED';
+}
+
+function getBrowserOAuthMaxAttempts(config) {
+  const restarts = Number(config.browserOAuthMaxRestarts);
+  if (!Number.isFinite(restarts)) return 3;
+  return Math.max(1, Math.floor(restarts) + 1);
+}
+
 function formatDurationMs(ms) {
   const totalSeconds = Math.max(0, Math.round(Number(ms) / 1000));
   const minutes = Math.floor(totalSeconds / 60);
@@ -387,7 +442,7 @@ function formatDurationMs(ms) {
   return `${minutes}分${String(seconds).padStart(2, '0')}秒`;
 }
 
-async function processAccountsQueue(accounts, { client, mailProvider, config }) {
+async function processAccountsQueue(accounts, { client, mailProvider, config, signal }) {
   const summary = {
     total: accounts.length,
     success: 0,
@@ -399,11 +454,12 @@ async function processAccountsQueue(accounts, { client, mailProvider, config }) 
   console.log(`[队列] 开始批量处理，共 ${accounts.length} 个账号`);
 
   for (let index = 0; index < accounts.length; index += 1) {
+    throwIfAborted(signal);
     const account = accounts[index];
     console.log(`[队列] 处理 ${index + 1}/${accounts.length}：${formatCandidateLine(account)}`);
 
     try {
-      const result = await reauthorizeAccount(account, { client, mailProvider, config });
+      const result = await reauthorizeAccount(account, { client, mailProvider, config, signal });
       if (result?.skipped) {
         summary.skipped += 1;
         console.log(`[队列] 已跳过：编号=${account.id} 邮箱=${getEmail(account)} 原因=${result.reason || '未知'}`);
@@ -413,6 +469,7 @@ async function processAccountsQueue(accounts, { client, mailProvider, config }) 
       summary.success += 1;
       console.log(`[队列] 处理成功：编号=${account.id} 邮箱=${getEmail(account)}`);
     } catch (error) {
+      if (isCancelError(error)) throw error;
       summary.failed += 1;
       console.warn(`[队列] 处理失败：编号=${account.id} 邮箱=${getEmail(account)} 原因=${error.message}`);
     }
@@ -424,9 +481,12 @@ async function processAccountsQueue(accounts, { client, mailProvider, config }) 
   return summary;
 }
 
-async function updateSuccess({ client, config, account, credentials, extra, result, startedAt }) {
+async function updateSuccess({ client, config, account, credentials, extra, result, startedAt, signal }) {
+  throwIfAborted(signal);
   await client.updateAccount(account.id, account, credentials, extra);
+  throwIfAborted(signal);
   await client.clearError(account.id);
+  throwIfAborted(signal);
   const tokenWrite = writeTokenFiles(credentials, config);
   const finishedAt = new Date().toISOString();
   const logPath = appendReauthLog(config.reauthLogFile, {
@@ -441,86 +501,168 @@ async function updateSuccess({ client, config, account, credentials, extra, resu
   return { tokenWrite, logPath };
 }
 
-async function reauthorizeAccount(account, { client, mailProvider, config }) {
-  const email = getEmail(account);
-  const planType = getPlanType(account);
-  const startedAt = new Date().toISOString();
-  const proxyId = account.proxy_id || undefined;
+async function runBrowserAuthSession({ config, account, action, signal }) {
+  throwIfAborted(signal);
+  const browserConfig = {
+    ...buildBrowserConfigForAccount(config, account),
+    signal: signal || null,
+  };
+  let browserProxyChain = null;
+  let browser = null;
+  const cleanupAbort = addAbortListener(signal, () => {
+    if (browser) browser.close().catch(() => {});
+    if (browserProxyChain) browserProxyChain.close().catch(() => {});
+  });
 
-  console.log(`[重授权] 开始处理 编号=${account.id} 名称="${account.name}" 邮箱=${email} 套餐=${planType || '未知'} 代理=${proxyId || '无'}`);
-
-  const browser = new BrowserAuth(config);
-  await browser.launch();
   try {
-    const authSession = await client.generateOpenAiAuthUrl({
-      proxyId,
-      redirectUri: config.oauthRedirectUri,
-    });
-    if (!authSession?.auth_url || !authSession?.session_id) {
-      throw new Error('generate-auth-url 没有返回 auth_url/session_id');
+    if (isBrowserProxyChainEnabled(browserConfig)) {
+      throwIfAborted(signal);
+      browserProxyChain = await startBrowserProxyChain(browserConfig);
+      browserConfig.browserProxyUrl = browserProxyChain.proxyUrl;
     }
 
-    let authResult;
-    try {
-      authResult = await browser.authorizeWithEmailOtp({
+    throwIfAborted(signal);
+    browser = new BrowserAuth(browserConfig);
+    await browser.launch();
+    throwIfAborted(signal);
+    return await action({ browser, browserConfig, signal });
+  } finally {
+    cleanupAbort();
+    if (browser) await browser.close();
+    if (browserProxyChain) await browserProxyChain.close();
+  }
+}
+
+async function runOAuthBrowserAttempt({ account, client, mailProvider, config, email, proxyId, attempt, maxAttempts, signal }) {
+  throwIfAborted(signal);
+  console.log(`[重授权] 全新浏览器 OAuth 开始 (${attempt}/${maxAttempts})`);
+
+  return runBrowserAuthSession({
+    config,
+    account,
+    signal,
+    action: async ({ browser }) => {
+      throwIfAborted(signal);
+      const authSession = await client.generateOpenAiAuthUrl({
+        proxyId,
+        redirectUri: config.oauthRedirectUri,
+      });
+      throwIfAborted(signal);
+      if (!authSession?.auth_url || !authSession?.session_id) {
+        throw new Error('generate-auth-url 没有返回 auth_url/session_id');
+      }
+
+      const authResult = await browser.authorizeWithEmailOtp({
         authUrl: authSession.auth_url,
         email,
         mailProvider,
         redirectUri: config.oauthRedirectUri,
+        signal,
       });
-    } catch (error) {
-      if (isSkippableReauthError(error)) {
-        return logSkippedReauth(account, config, startedAt, error);
-      }
 
-      if (!(error instanceof AddPhoneRequiredError || error?.code === 'ADD_PHONE_REQUIRED')) {
-        throw error;
-      }
+      throwIfAborted(signal);
+      return { authSession, authResult };
+    },
+  });
+}
 
-      if (planType !== 'plus') {
-        const finishedAt = new Date().toISOString();
-        const logPath = appendReauthLog(config.reauthLogFile, {
-          ...buildLogBase(account),
-          result: 'skipped_add_phone_free',
-          authMode: 'email_otp',
-          startedAt,
-          finishedAt,
-          error: error.message,
-        });
-        console.warn(`[重授权] 免费/非 Plus 账号要求手机号验证，已跳过。日志=${logPath}`);
-        return { skipped: true, reason: 'add_phone', logPath };
-      }
+async function runPlusSessionFallback({ account, client, mailProvider, config, email, startedAt, signal }) {
+  return runBrowserAuthSession({
+    config,
+    account,
+    signal,
+    action: async ({ browser }) => {
+      const sessionState = await browser.loginChatGptWithEmailOtp({
+        email,
+        mailProvider,
+        signal,
+      });
+      throwIfAborted(signal);
+      const credentials = buildSessionAtCredentials({
+        account,
+        session: sessionState.session,
+        accessToken: sessionState.accessToken,
+        forcePlanType: 'plus',
+      });
+      const extra = buildUpdatedExtra(account.extra, {}, 'session_at');
+      const success = await updateSuccess({
+        client,
+        config,
+        account,
+        credentials,
+        extra,
+        result: 'success_session_at',
+        startedAt,
+        signal,
+      });
+      console.log(`[重授权] Plus session AT 已更新。token=${success.tokenWrite.savedPaths.join(' | ')}`);
+      return { ok: true, mode: 'session_at', ...success };
+    },
+  });
+}
 
-      console.warn('[重授权] Plus 账号遇到手机号验证，关闭当前浏览器并重新登录 ChatGPT 获取 session access token');
-      await browser.close();
+async function reauthorizeAccount(account, { client, mailProvider, config, signal }) {
+  throwIfAborted(signal);
+  const email = getEmail(account);
+  const planType = getPlanType(account);
+  const startedAt = new Date().toISOString();
+  const proxyId = account.proxy_id || undefined;
+  const maxAttempts = getBrowserOAuthMaxAttempts(config);
 
-      const sessionBrowser = new BrowserAuth(config);
-      await sessionBrowser.launch();
+  console.log(`[重授权] 开始处理 编号=${account.id} 名称="${account.name}" 邮箱=${email} 套餐=${planType || '未知'} 代理=${proxyId || '无'}`);
+
+  try {
+    let authSession;
+    let authResult;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      throwIfAborted(signal);
       try {
-        const sessionState = await sessionBrowser.loginChatGptWithEmailOtp({
-          email,
-          mailProvider,
-        });
-        const credentials = buildSessionAtCredentials({
+        const result = await runOAuthBrowserAttempt({
           account,
-          session: sessionState.session,
-          accessToken: sessionState.accessToken,
-          forcePlanType: 'plus',
-        });
-        const extra = buildUpdatedExtra(account.extra, {}, 'session_at');
-        const success = await updateSuccess({
           client,
+          mailProvider,
           config,
-          account,
-          credentials,
-          extra,
-          result: 'success_session_at',
-          startedAt,
+          email,
+          proxyId,
+          attempt,
+          maxAttempts,
+          signal,
         });
-        console.log(`[重授权] Plus session AT 已更新。token=${success.tokenWrite.savedPaths.join(' | ')}`);
-        return { ok: true, mode: 'session_at', ...success };
-      } finally {
-        await sessionBrowser.close();
+        authSession = result.authSession;
+        authResult = result.authResult;
+        break;
+      } catch (error) {
+        if (isCancelError(error)) throw error;
+        if (isSkippableReauthError(error)) {
+          return logSkippedReauth(account, config, startedAt, error);
+        }
+
+        if (isAddPhoneRequiredError(error)) {
+          if (planType !== 'plus') {
+            const finishedAt = new Date().toISOString();
+            const logPath = appendReauthLog(config.reauthLogFile, {
+              ...buildLogBase(account),
+              result: 'skipped_add_phone_free',
+              authMode: 'email_otp',
+              startedAt,
+              finishedAt,
+              error: error.message,
+            });
+            console.warn(`[重授权] 免费/非 Plus 账号要求手机号验证，已跳过。日志=${logPath}`);
+            return { skipped: true, reason: 'add_phone', logPath };
+          }
+
+          console.warn('[重授权] Plus 账号遇到手机号验证，重新登录 ChatGPT 获取 session access token');
+          return runPlusSessionFallback({ account, client, mailProvider, config, email, startedAt, signal });
+        }
+
+        if (isOAuthBrowserRestartRequired(error) && attempt < maxAttempts) {
+          console.warn(`[重授权] ${error.message}；关闭当前 OAuth 浏览器并重试 (${attempt + 1}/${maxAttempts})`);
+          continue;
+        }
+
+        throw error;
       }
     }
 
@@ -528,6 +670,7 @@ async function reauthorizeAccount(account, { client, mailProvider, config }) {
       throw new Error(`浏览器授权结果异常：${JSON.stringify(authResult)}`);
     }
 
+    throwIfAborted(signal);
     const callbackParams = parseCallbackParams(authResult.callbackUrl);
     const exchangeData = await client.exchangeOpenAiCode({
       sessionId: authSession.session_id,
@@ -536,6 +679,7 @@ async function reauthorizeAccount(account, { client, mailProvider, config }) {
       redirectUri: config.oauthRedirectUri,
       proxyId,
     });
+    throwIfAborted(signal);
     const credentials = mergeOAuthCredentials(account.credentials || {}, exchangeData);
     const extra = buildUpdatedExtra(account.extra, exchangeData, 'oauth');
     const success = await updateSuccess({
@@ -546,10 +690,12 @@ async function reauthorizeAccount(account, { client, mailProvider, config }) {
       extra,
       result: 'success_oauth',
       startedAt,
+      signal,
     });
     console.log(`[重授权] OAuth 凭据已更新。token=${success.tokenWrite.savedPaths.join(' | ')}`);
     return { ok: true, mode: 'oauth', ...success };
   } catch (error) {
+    if (isCancelError(error)) throw error;
     const finishedAt = new Date().toISOString();
     const logPath = appendReauthLog(config.reauthLogFile, {
       ...buildLogBase(account),
@@ -560,8 +706,6 @@ async function reauthorizeAccount(account, { client, mailProvider, config }) {
     });
     console.error(`[重授权] 处理失败：${error.message}。日志=${logPath}`);
     throw error;
-  } finally {
-    await browser.close();
   }
 }
 

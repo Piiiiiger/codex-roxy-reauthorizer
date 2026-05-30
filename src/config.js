@@ -22,6 +22,12 @@ function toInt(value, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function toBool(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
 function toArray(value) {
   if (Array.isArray(value)) return value.filter(Boolean);
   if (typeof value === 'string' && value.trim()) {
@@ -38,6 +44,13 @@ function loadConfig() {
   const candidateErrorKeywords = toArray(envOrConfig('CANDIDATE_ERROR_KEYWORDS', raw, 'candidateErrorKeywords', []));
   const preferredGroupNames = toArray(envOrConfig('PREFERRED_GROUP_NAMES', raw, 'preferredGroupNames', []));
   const preferredGroupIds = toArray(envOrConfig('PREFERRED_GROUP_IDS', raw, 'preferredGroupIds', []));
+  const browserEngine = String(envOrConfig('BROWSER_ENGINE', raw, 'browserEngine', 'camoufox')).trim() || 'camoufox';
+  const normalizedBrowserEngine = ['chrome', 'chromium', 'edge', 'puppeteer'].includes(browserEngine.toLowerCase())
+    ? 'chrome'
+    : 'camoufox';
+  const browserUserDataDirDefault = normalizedBrowserEngine === 'camoufox'
+    ? 'data/camoufox-profile'
+    : 'data/browser-profile';
 
   return {
     sub2apiBaseUrl: String(envOrConfig('SUB2API_BASE_URL', raw, 'sub2apiBaseUrl', '')).replace(/\/+$/, ''),
@@ -60,6 +73,15 @@ function loadConfig() {
     browserWindowHeight: toInt(envOrConfig('BROWSER_WINDOW_HEIGHT', raw, 'browserWindowHeight', 540), 540),
     browserWindowStartX: toInt(envOrConfig('BROWSER_WINDOW_START_X', raw, 'browserWindowStartX', 0), 0),
     browserWindowStartY: toInt(envOrConfig('BROWSER_WINDOW_START_Y', raw, 'browserWindowStartY', 0), 0),
+    browserEngine,
+    browserEngineFallbackToChrome: toBool(envOrConfig('BROWSER_ENGINE_FALLBACK_TO_CHROME', raw, 'browserEngineFallbackToChrome', false), false),
+    browserUserDataDir: String(envOrConfig('BROWSER_USER_DATA_DIR', raw, 'browserUserDataDir', browserUserDataDirDefault)),
+    browserProxyUrl: String(envOrConfig('BROWSER_PROXY_URL', raw, 'browserProxyUrl', '')),
+    browserProxyChainFirst: String(envOrConfig('BROWSER_PROXY_CHAIN_FIRST', raw, 'browserProxyChainFirst', '')),
+    browserProxyChainBinary: String(envOrConfig('BROWSER_PROXY_CHAIN_BINARY', raw, 'browserProxyChainBinary', '/home/pigger/.config/sub2api/cliproxy_chain_proxy')),
+    browserProxyChainListenHost: String(envOrConfig('BROWSER_PROXY_CHAIN_LISTEN_HOST', raw, 'browserProxyChainListenHost', '127.0.0.1')),
+    browserProxyChainStartupTimeoutMs: toInt(envOrConfig('BROWSER_PROXY_CHAIN_STARTUP_TIMEOUT_MS', raw, 'browserProxyChainStartupTimeoutMs', 5000), 5000),
+    browserOAuthMaxRestarts: toInt(envOrConfig('BROWSER_OAUTH_MAX_RESTARTS', raw, 'browserOAuthMaxRestarts', 2), 2),
     useChrome: raw.useChrome !== false,
     chromePath: String(envOrConfig('CHROME_PATH', raw, 'chromePath', '')),
     useEdge: raw.useEdge === true,

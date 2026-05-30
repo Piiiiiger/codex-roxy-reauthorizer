@@ -1,5 +1,6 @@
 const fs = require('fs');
 const http = require('http');
+const os = require('os');
 const path = require('path');
 const util = require('util');
 const { URL } = require('url');
@@ -14,12 +15,14 @@ const {
   getGroupNames,
   isOpenAiOauthAccount,
 } = require('./cli');
+const { TaskCancelledError, isCancelError, throwIfAborted } = require('./cancel');
 
 const SECRET_KEYS = new Set([
   'sub2apiAdminPassword',
   'sub2apiTurnstileToken',
   'mailAdminPassword',
   'mailSitePassword',
+  'browserProxyUrl',
   'pluginAccessToken',
 ]);
 
@@ -41,6 +44,15 @@ const CONFIG_KEYS = new Set([
   'browserWindowHeight',
   'browserWindowStartX',
   'browserWindowStartY',
+  'browserEngine',
+  'browserEngineFallbackToChrome',
+  'browserUserDataDir',
+  'browserProxyUrl',
+  'browserProxyChainFirst',
+  'browserProxyChainBinary',
+  'browserProxyChainListenHost',
+  'browserProxyChainStartupTimeoutMs',
+  'browserOAuthMaxRestarts',
   'useChrome',
   'chromePath',
   'useEdge',
@@ -69,9 +81,11 @@ const NUMBER_KEYS = new Set([
   'browserWindowStartX',
   'browserWindowStartY',
   'pluginPort',
+  'browserProxyChainStartupTimeoutMs',
+  'browserOAuthMaxRestarts',
 ]);
 
-const BOOLEAN_KEYS = new Set(['useChrome', 'useEdge']);
+const BOOLEAN_KEYS = new Set(['browserEngineFallbackToChrome', 'useChrome', 'useEdge']);
 
 const jobs = new Map();
 const recentJobIds = [];
@@ -101,6 +115,30 @@ function writeRawConfig(config) {
 
 function loadCurrentConfig() {
   return loadConfig();
+}
+
+function getLanIPv4Addresses() {
+  const interfaces = os.networkInterfaces();
+  const addresses = [];
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries || []) {
+      if (entry.family === 'IPv4' && !entry.internal) {
+        addresses.push(entry.address);
+      }
+    }
+  }
+  return addresses;
+}
+
+function buildPluginBaseUrls(config) {
+  const port = config.pluginPort || 8765;
+  const host = String(config.pluginHost || '127.0.0.1');
+  const hosts = [
+    ...(host === '0.0.0.0' || host === '::' ? getLanIPv4Addresses() : [host]),
+    '127.0.0.1',
+    'localhost',
+  ];
+  return Array.from(new Set(hosts.filter(Boolean))).map((item) => `http://${item}:${port}`);
 }
 
 function sanitizeConfig(config) {
@@ -152,18 +190,27 @@ function updateConfigFromPayload(payload) {
 }
 
 function buildConfigStatus(config) {
+  const isTokenMailbox = /\/token(?:[/?#]|$)/.test(String(config.mailBaseUrl || ''));
+  const hasMailboxAuth = Boolean(config.mailAdminPassword || isTokenMailbox);
+
   return {
     configPath: getConfigPath(),
     sub2apiBaseUrl: config.sub2apiBaseUrl,
     mailBaseUrl: config.mailBaseUrl,
+    mailSourceType: isTokenMailbox ? 'token-page' : 'mail-api',
     oauthRedirectUri: config.oauthRedirectUri,
     reauthLogFile: config.reauthLogFile,
     tokenOutputDirs: config.tokenOutputDirs,
+    browserEngine: config.browserEngine,
+    browserEngineFallbackToChrome: config.browserEngineFallbackToChrome,
+    browserUserDataDir: config.browserUserDataDir,
     pluginHost: config.pluginHost,
     pluginPort: config.pluginPort,
     hasSub2apiAdminEmail: Boolean(config.sub2apiAdminEmail),
     hasSub2apiAdminPassword: Boolean(config.sub2apiAdminPassword),
     hasMailAdminPassword: Boolean(config.mailAdminPassword),
+    hasBrowserProxyUrl: Boolean(config.browserProxyUrl),
+    hasBrowserProxyChain: Boolean(config.browserProxyChainFirst),
     hasPluginAccessToken: Boolean(config.pluginAccessToken),
     canScan: Boolean(config.sub2apiBaseUrl && config.sub2apiAdminEmail && config.sub2apiAdminPassword),
     canReauthorize: Boolean(
@@ -171,27 +218,29 @@ function buildConfigStatus(config) {
       && config.sub2apiAdminEmail
       && config.sub2apiAdminPassword
       && config.mailBaseUrl
-      && config.mailAdminPassword
+      && hasMailboxAuth
     ),
   };
 }
 
-function buildClient(config) {
+function buildClient(config, signal = null) {
   return new Sub2ApiClient({
     baseUrl: config.sub2apiBaseUrl,
     adminEmail: config.sub2apiAdminEmail,
     adminPassword: config.sub2apiAdminPassword,
     turnstileToken: config.sub2apiTurnstileToken,
+    signal,
   });
 }
 
-function buildMailProvider(config) {
+function buildMailProvider(config, signal = null) {
   return new MailProvider({
     baseUrl: config.mailBaseUrl,
     adminPassword: config.mailAdminPassword,
     sitePassword: config.mailSitePassword,
     domain: config.mailDomain,
     timeoutMs: config.mailTimeoutMs,
+    signal,
   });
 }
 
@@ -368,6 +417,8 @@ function compactJob(job) {
     startedAt: job.startedAt,
     finishedAt: job.finishedAt,
     error: job.error,
+    cancelRequested: Boolean(job.cancelRequested),
+    cancelReason: job.cancelReason || '',
     progress: job.progress,
     summary: job.summary,
     logs: job.logs.slice(-300),
@@ -387,6 +438,8 @@ function listJobs() {
       startedAt: job.startedAt,
       finishedAt: job.finishedAt,
       error: job.error,
+      cancelRequested: Boolean(job.cancelRequested),
+      cancelReason: job.cancelReason || '',
       progress: job.progress,
       summary: job.summary,
     }));
@@ -403,10 +456,12 @@ function createJob(type, payload) {
   }
 
   const id = String(nextJobId++);
+  const abortController = new AbortController();
   const job = {
     id,
     type,
     payload,
+    abortController,
     status: 'queued',
     createdAt: new Date().toISOString(),
     startedAt: '',
@@ -414,6 +469,8 @@ function createJob(type, payload) {
     error: '',
     progress: { current: 0, total: 0, label: '' },
     summary: null,
+    cancelRequested: false,
+    cancelReason: '',
     logs: [],
     results: [],
   };
@@ -425,6 +482,39 @@ function createJob(type, payload) {
   }
   activeJobId = id;
   setImmediate(() => runJob(job).catch(() => {}));
+  return job;
+}
+
+function cancelJob(jobId, reason = '用户停止任务') {
+  const job = jobs.get(String(jobId));
+  if (!job) {
+    const error = new Error('任务不存在');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  if (!['queued', 'running'].includes(job.status)) {
+    return job;
+  }
+
+  const message = String(reason || '').trim() || '用户停止任务';
+  if (!job.cancelRequested) {
+    job.cancelRequested = true;
+    job.cancelReason = message;
+    appendJobLog(job, 'warn', [`已请求停止任务：${message}`]);
+  }
+
+  if (!job.abortController?.signal?.aborted) {
+    job.abortController?.abort(new TaskCancelledError(message));
+  }
+
+  if (job.status === 'queued') {
+    job.status = 'cancelled';
+    job.error = message;
+    job.finishedAt = new Date().toISOString();
+    if (activeJobId === job.id) activeJobId = null;
+  }
+
   return job;
 }
 
@@ -451,26 +541,35 @@ async function resolveJobAccounts(client, config, payload) {
 }
 
 async function runJob(job) {
+  const signal = job.abortController?.signal || null;
+  if (job.status === 'cancelled') {
+    if (activeJobId === job.id) activeJobId = null;
+    return;
+  }
+
   job.status = 'running';
   job.startedAt = new Date().toISOString();
   appendJobLog(job, 'info', [`任务开始：${job.type}`]);
 
   try {
     await withJobConsole(job, async () => {
+      throwIfAborted(signal);
       const config = loadCurrentConfig();
       if (!buildConfigStatus(config).canReauthorize) {
         throw new Error('配置不完整：需要 sub2api 管理账号和邮箱辅助服务配置');
       }
 
-      const client = buildClient(config);
-      const mailProvider = buildMailProvider(config);
+      const client = buildClient(config, signal);
+      const mailProvider = buildMailProvider(config, signal);
       const accounts = await resolveJobAccounts(client, config, job.payload || {});
+      throwIfAborted(signal);
       if (!accounts.length) throw new Error('没有匹配到可处理账号');
 
       job.progress.total = accounts.length;
       job.summary = { total: accounts.length, success: 0, failed: 0, skipped: 0 };
 
       for (let index = 0; index < accounts.length; index += 1) {
+        throwIfAborted(signal);
         const account = accounts[index];
         const summary = accountSummary(account);
         job.progress.current = index + 1;
@@ -478,7 +577,7 @@ async function runJob(job) {
         appendJobLog(job, 'info', [`处理 ${index + 1}/${accounts.length}：编号=${summary.id} 邮箱=${summary.email}`]);
 
         try {
-          const result = await reauthorizeAccount(account, { client, mailProvider, config });
+          const result = await reauthorizeAccount(account, { client, mailProvider, config, signal });
           if (result?.skipped) {
             job.summary.skipped += 1;
             job.results.push({ account: summary, status: 'skipped', reason: result.reason || '', logPath: result.logPath || '' });
@@ -487,6 +586,7 @@ async function runJob(job) {
             job.results.push({ account: summary, status: 'success', mode: result?.mode || '', logPath: result?.logPath || '' });
           }
         } catch (error) {
+          if (isCancelError(error)) throw error;
           job.summary.failed += 1;
           job.results.push({ account: summary, status: 'failed', error: error.message });
           appendJobLog(job, 'error', [`处理失败：编号=${summary.id} 邮箱=${summary.email} 原因=${error.message}`]);
@@ -494,12 +594,21 @@ async function runJob(job) {
       }
     });
 
+    throwIfAborted(signal);
     job.status = 'success';
     appendJobLog(job, 'info', ['任务完成']);
   } catch (error) {
-    job.status = 'failed';
-    job.error = error.message;
-    appendJobLog(job, 'error', [`任务失败：${error.message}`]);
+    if (isCancelError(error)) {
+      job.status = 'cancelled';
+      job.cancelRequested = true;
+      job.cancelReason = error.message || job.cancelReason || '任务已停止';
+      job.error = job.cancelReason;
+      appendJobLog(job, 'warn', [`任务已停止：${job.cancelReason}`]);
+    } else {
+      job.status = 'failed';
+      job.error = error.message;
+      appendJobLog(job, 'error', [`任务失败：${error.message}`]);
+    }
   } finally {
     job.finishedAt = new Date().toISOString();
     if (activeJobId === job.id) activeJobId = null;
@@ -509,9 +618,11 @@ async function runJob(job) {
 function buildUserscript(config) {
   const filePath = path.join(process.cwd(), 'public', 'sub2api-reauthorizer.user.js');
   let source = fs.readFileSync(filePath, 'utf8');
-  const baseUrl = `http://${config.pluginHost || '127.0.0.1'}:${config.pluginPort || 8765}`;
+  const baseUrls = buildPluginBaseUrls(config);
+  const baseUrl = baseUrls[0] || `http://127.0.0.1:${config.pluginPort || 8765}`;
   source = source
     .replace(/__PLUGIN_BASE_URL__/g, JSON.stringify(baseUrl))
+    .replace(/__PLUGIN_BASE_URLS__/g, JSON.stringify(baseUrls))
     .replace(/__PLUGIN_ACCESS_TOKEN__/g, JSON.stringify(config.pluginAccessToken || ''));
   return source;
 }
@@ -589,6 +700,17 @@ async function handleApi(req, res, url, config, origin) {
     return;
   }
 
+  const cancelMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/cancel$/);
+  if (req.method === 'POST' && cancelMatch) {
+    const body = await readRequestBody(req);
+    const job = cancelJob(decodeURIComponent(cancelMatch[1]), body.reason || '用户停止任务');
+    sendJson(res, 200, {
+      ok: true,
+      job: compactJob(job),
+    }, origin);
+    return;
+  }
+
   const jobMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)$/);
   if (req.method === 'GET' && jobMatch) {
     const job = jobs.get(decodeURIComponent(jobMatch[1]));
@@ -604,7 +726,8 @@ async function handleApi(req, res, url, config, origin) {
 }
 
 function rootHtml(config) {
-  const baseUrl = `http://${config.pluginHost || '127.0.0.1'}:${config.pluginPort || 8765}`;
+  const baseUrls = buildPluginBaseUrls(config);
+  const baseUrl = baseUrls[0] || `http://127.0.0.1:${config.pluginPort || 8765}`;
   return `<!doctype html>
 <html lang="zh-CN">
 <meta charset="utf-8">
@@ -612,6 +735,7 @@ function rootHtml(config) {
 <body style="font-family: system-ui, sans-serif; margin: 32px; line-height: 1.5">
   <h1>Sub2API 重授权插件服务</h1>
   <p>服务已启动：${baseUrl}</p>
+  <p>可尝试地址：${baseUrls.join(' / ')}</p>
   <p><a href="/sub2api-reauthorizer.user.js">安装/查看 userscript</a></p>
   <p>安装 userscript 后，打开 sub2api 管理页会出现右侧浮动的“重授权”入口。</p>
 </body>
@@ -665,8 +789,10 @@ function startPluginServer() {
   });
 
   server.listen(initialConfig.pluginPort, initialConfig.pluginHost, () => {
-    const baseUrl = `http://${initialConfig.pluginHost}:${initialConfig.pluginPort}`;
+    const baseUrls = buildPluginBaseUrls(initialConfig);
+    const baseUrl = baseUrls[0] || `http://${initialConfig.pluginHost}:${initialConfig.pluginPort}`;
     console.log(`[插件] 服务已启动：${baseUrl}`);
+    console.log(`[插件] 可尝试地址：${baseUrls.join(' / ')}`);
     console.log(`[插件] userscript：${baseUrl}/sub2api-reauthorizer.user.js`);
   });
 

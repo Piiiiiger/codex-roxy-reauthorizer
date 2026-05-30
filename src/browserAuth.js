@@ -2,9 +2,90 @@
 const os = require('os');
 const path = require('path');
 const { connect } = require('puppeteer-real-browser');
-const { extractVerificationCodeFromMailRaw } = require('./emailCode');
+const { extractVerificationCodeFromMailRaw, pollEmailCodeByAddress } = require('./emailCode');
+const { abortableSleep, addAbortListener, isCancelError, throwIfAborted } = require('./cancel');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function rethrowIfCancel(error) {
+  if (isCancelError(error)) throw error;
+}
+
+function normalizeBrowserEngine(value) {
+  const engine = String(value || 'camoufox').trim().toLowerCase();
+  if (['camoufox', 'privacy', 'private', 'firefox'].includes(engine)) return 'camoufox';
+  if (['chrome', 'chromium', 'edge', 'puppeteer'].includes(engine)) return 'chrome';
+  return 'camoufox';
+}
+
+function resolvePathMaybeRelative(value) {
+  const candidate = String(value || '').trim();
+  if (!candidate) return '';
+  return path.isAbsolute(candidate) ? candidate : path.join(process.cwd(), candidate);
+}
+
+function getPageUrl(page) {
+  const raw = page?.url;
+  return String(typeof raw === 'function' ? raw.call(page) : raw || '');
+}
+
+function getRequestUrl(request) {
+  const raw = request?.url;
+  return String(typeof raw === 'function' ? raw.call(request) : raw || '');
+}
+
+function parseBrowserProxyUrl(proxyUrl) {
+  const raw = String(proxyUrl || '').trim();
+  if (!raw) return null;
+
+  const normalized = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new Error('浏览器授权代理格式无效，请使用 host:port 或 protocol://user:pass@host:port');
+  }
+
+  if (!parsed.hostname || !parsed.port) {
+    throw new Error('浏览器授权代理需要包含主机和端口');
+  }
+
+  const protocol = parsed.protocol.replace(/:$/, '').toLowerCase();
+  const host = protocol === 'http'
+    ? parsed.hostname
+    : `${protocol}://${parsed.hostname}`;
+
+  return {
+    host,
+    port: parsed.port,
+    username: parsed.username ? decodeURIComponent(parsed.username) : '',
+    password: parsed.password ? decodeURIComponent(parsed.password) : '',
+  };
+}
+
+function parsePlaywrightProxyUrl(proxyUrl) {
+  const raw = String(proxyUrl || '').trim();
+  if (!raw) return null;
+
+  const normalized = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new Error('浏览器授权代理格式无效，请使用 host:port 或 protocol://user:pass@host:port');
+  }
+
+  if (!parsed.hostname || !parsed.port) {
+    throw new Error('浏览器授权代理需要包含主机和端口');
+  }
+
+  const proxy = {
+    server: `${parsed.protocol.replace(/:$/, '').toLowerCase()}://${parsed.host}`,
+  };
+  if (parsed.username) proxy.username = decodeURIComponent(parsed.username);
+  if (parsed.password) proxy.password = decodeURIComponent(parsed.password);
+  return proxy;
+}
 
 const EMAIL_LOGIN_TEXTS = [
   'Continue with email',
@@ -36,6 +117,15 @@ const CHATGPT_LOGIN_TEXTS = [
   'Sign in',
   '\u767b\u5f55',
   '\u767b\u5165',
+];
+
+const ACCOUNT_SWITCH_TEXTS = [
+  'Use another account',
+  'Log in to another account',
+  'Sign in with another account',
+  'Continue with another account',
+  '\u4f7f\u7528\u5176\u4ed6\u8d26\u6237',
+  '\u767b\u5f55\u5176\u4ed6\u8d26\u6237',
 ];
 
 function textMatchesAny(value, candidates) {
@@ -92,14 +182,78 @@ function isCodePage(pageInfo) {
   const hasCodeCopy = CODE_PAGE_TEXT_RE.test(pageText);
   const inputs = Array.isArray(pageInfo?.inputs) ? pageInfo.inputs : [];
   const hasLikelyField = inputs.some((input) => isLikelyVerificationInput(input));
-  const hasVisibleInput = inputs.some((input) => Boolean(input?.visible));
-
-  return (hasCodeRoute || hasCodeCopy) && (hasLikelyField || hasVisibleInput);
+  return (hasCodeRoute || hasCodeCopy) && hasLikelyField;
 }
 
 function isConsentPage(pageInfo) {
   const url = String(pageInfo?.url || '').toLowerCase();
   return /sign-in-with-chatgpt\/codex\/consent/.test(url) || /\/consent(?:[/?#]|$)/.test(url);
+}
+
+function hasEmailInput(pageInfo) {
+  const inputs = Array.isArray(pageInfo?.inputs) ? pageInfo.inputs : [];
+  return inputs.some((input) => (
+    input.visible
+    && (
+      input.type === 'email'
+      || ['email', 'username', 'identifier'].includes(input.name)
+      || String(input.autocomplete || '').toLowerCase().includes('username')
+    )
+  ));
+}
+
+function hasPasswordInput(pageInfo) {
+  const inputs = Array.isArray(pageInfo?.inputs) ? pageInfo.inputs : [];
+  return inputs.some((input) => input.visible && input.type === 'password')
+    || /password/i.test(String(pageInfo?.url || ''));
+}
+
+function isChooseAccountPage(pageInfo) {
+  const url = String(pageInfo?.url || '').toLowerCase();
+  const combined = [
+    pageInfo?.url,
+    pageInfo?.title,
+    pageInfo?.text,
+    ...(Array.isArray(pageInfo?.buttons) ? pageInfo.buttons : []),
+  ].join('\n').toLowerCase();
+  return (
+    /choose[-_]?an[-_]?account/.test(url)
+    || combined.includes('choose an account to continue')
+    || combined.includes('use another account')
+    || combined.includes('log in to another account')
+    || combined.includes('sign in with another account')
+  );
+}
+
+function isOpenAiTimeoutErrorPage(pageInfo) {
+  const combined = [
+    pageInfo?.url,
+    pageInfo?.title,
+    pageInfo?.errorSummary,
+    pageInfo?.text,
+    ...(Array.isArray(pageInfo?.buttons) ? pageInfo.buttons : []),
+  ].join('\n').toLowerCase();
+  return (
+    combined.includes('operation timed out')
+    || combined.includes('oops, an error occurred')
+    || combined.includes('oops, something went wrong')
+    || combined.includes('something went wrong')
+    || /\u7cdf\u7cd5.*\u51fa\u9519/.test(combined)
+    || combined.includes('\u64cd\u4f5c\u8d85\u65f6')
+  );
+}
+
+function deriveOAuthPageType(pageInfo) {
+  if (!pageInfo) return '';
+  if (isOpenAiTimeoutErrorPage(pageInfo)) return 'timeout_error';
+  if (isChooseAccountPage(pageInfo)) return 'choose_account';
+  if (isConsentPage(pageInfo)) return 'consent';
+  if (hasPasswordInput(pageInfo)) return 'login_password';
+  if (isCodePage(pageInfo)) return 'email_otp_verification';
+  if (hasEmailInput(pageInfo)) return 'login_email';
+  if (pageInfo.buttons?.some((button) => textMatchesAny(button, EMAIL_LOGIN_TEXTS))) return 'continue_with_email';
+  if (/chatgpt\.com/i.test(String(pageInfo.url || ''))) return 'chatgpt_home';
+  return '';
 }
 
 function normalizeMailsFromPayload(payload) {
@@ -139,14 +293,32 @@ class AccountDeactivatedError extends Error {
   }
 }
 
+class OAuthBrowserRestartRequiredError extends Error {
+  constructor(message = 'OpenAI OAuth 浏览器需要重启后重试') {
+    super(message);
+    this.name = 'OAuthBrowserRestartRequiredError';
+    this.code = 'OAUTH_BROWSER_RESTART_REQUIRED';
+  }
+}
+
 class BrowserAuth {
   constructor(config) {
     this.config = config;
+    this.signal = config.signal || null;
     this.browser = null;
     this.page = null;
     this.mailboxPage = null;
     this.mailboxBaseUrl = '';
+    this.browserEngine = '';
     this.screenshotDir = path.join(os.tmpdir(), 'codex-openai-reauthorizer');
+  }
+
+  throwIfCancelled(signal = this.signal) {
+    throwIfAborted(signal);
+  }
+
+  async sleep(ms, signal = this.signal) {
+    return signal ? abortableSleep(ms, signal) : sleep(ms);
   }
 
   getBrowserCandidatePaths() {
@@ -185,36 +357,138 @@ class BrowserAuth {
     return candidate;
   }
 
-  async launch() {
+  resolveBrowserUserDataDir() {
+    const configured = String(this.config.browserUserDataDir || '').trim();
+    const engine = normalizeBrowserEngine(this.config.browserEngine);
+    const fallback = engine === 'camoufox' ? 'data/camoufox-profile' : 'data/browser-profile';
+    return resolvePathMaybeRelative(configured || fallback);
+  }
+
+  async setPageViewport(page) {
+    if (!page) return;
+    const viewport = {
+      width: this.config.browserWindowWidth,
+      height: this.config.browserWindowHeight,
+    };
+    if (typeof page.setViewport === 'function') {
+      await page.setViewport(viewport).catch(() => {});
+      return;
+    }
+    if (typeof page.setViewportSize === 'function') {
+      await page.setViewportSize(viewport).catch(() => {});
+    }
+  }
+
+  async launchChrome() {
     const args = [
       '--no-sandbox',
       '--disable-gpu',
       `--window-size=${this.config.browserWindowWidth},${this.config.browserWindowHeight}`,
       `--window-position=${this.config.browserWindowStartX},${this.config.browserWindowStartY}`,
     ];
+    const userDataDir = this.resolveBrowserUserDataDir();
+    fs.mkdirSync(userDataDir, { recursive: true });
     const connectOptions = {
       headless: false,
       turnstile: true,
       args,
+      customConfig: {
+        userDataDir,
+      },
     };
+    const proxy = parseBrowserProxyUrl(this.config.browserProxyUrl);
+    if (proxy) {
+      connectOptions.proxy = proxy;
+      console.log(`[浏览器] 使用授权代理：${proxy.host}:${proxy.port}`);
+    }
 
     const preferred = this.config.useEdge ? this.config.edgePath : this.config.chromePath;
     const executablePath = this.resolveExecutablePath(preferred);
     if (executablePath) {
-      connectOptions.customConfig = { chromePath: executablePath };
+      connectOptions.customConfig.chromePath = executablePath;
       process.env.CHROME_PATH = executablePath;
       console.log(`[浏览器] 使用可执行文件：${executablePath}`);
     }
+    console.log(`[浏览器] 使用 Chrome/Puppeteer 资料目录：${userDataDir}`);
 
     const { browser, page } = await connect(connectOptions);
     this.browser = browser;
+    this.browserEngine = 'chrome';
     const pages = await browser.pages?.();
     this.page = pages && pages.length > 0 ? await browser.newPage() : page;
     await this.page.bringToFront().catch(() => {});
-    await this.page.setViewport({
-      width: this.config.browserWindowWidth,
-      height: this.config.browserWindowHeight,
+    await this.setPageViewport(this.page);
+  }
+
+  async firstPageOrNew(browser) {
+    const pages = typeof browser?.pages === 'function' ? browser.pages() : [];
+    const firstBlank = pages.find((item) => {
+      const url = getPageUrl(item);
+      return !url || ['about:blank', 'chrome://newtab/'].includes(String(url));
     });
+    if (firstBlank) return firstBlank;
+    if (pages.length > 0) return pages[0];
+    return browser.newPage();
+  }
+
+  async launchCamoufox() {
+    let Camoufox;
+    try {
+      ({ Camoufox } = require('camoufox'));
+    } catch (error) {
+      throw new Error(`Camoufox 依赖未安装：${error.message}`);
+    }
+
+    const userDataDir = this.resolveBrowserUserDataDir();
+    fs.mkdirSync(userDataDir, { recursive: true });
+    const proxy = parsePlaywrightProxyUrl(this.config.browserProxyUrl);
+    const launchOptions = {
+      headless: false,
+      data_dir: userDataDir,
+      window: [this.config.browserWindowWidth, this.config.browserWindowHeight],
+      humanize: 0.5,
+      firefox_user_prefs: {
+        'browser.privatebrowsing.autostart': true,
+        'browser.sessionstore.resume_from_crash': false,
+        'browser.startup.page': 0,
+      },
+    };
+    if (proxy) {
+      launchOptions.proxy = proxy;
+      launchOptions.geoip = true;
+      const safeServer = proxy.server.replace(/\/\/.*@/, '//');
+      console.log(`[浏览器] 使用 Camoufox 授权代理：${safeServer}`);
+    }
+
+    console.log(`[浏览器] 使用 Camoufox 隐私浏览器，资料目录：${userDataDir}`);
+    const browser = await Camoufox(launchOptions);
+    this.browser = browser;
+    this.browserEngine = 'camoufox';
+    this.page = await this.firstPageOrNew(browser);
+    await this.page.bringToFront().catch(() => {});
+    await this.setPageViewport(this.page);
+  }
+
+  async launch() {
+    this.throwIfCancelled();
+    const engine = normalizeBrowserEngine(this.config.browserEngine);
+    if (engine === 'chrome') {
+      await this.launchChrome();
+      this.throwIfCancelled();
+      return;
+    }
+
+    try {
+      await this.launchCamoufox();
+    } catch (error) {
+      const fallbackToChrome = this.config.browserEngineFallbackToChrome === true;
+      if (!fallbackToChrome) {
+        throw new Error(`Camoufox 隐私浏览器启动失败：${error.message}`);
+      }
+      console.warn(`[浏览器] Camoufox 启动失败，回退 Chrome/Puppeteer：${error.message}`);
+      await this.launchChrome();
+    }
+    this.throwIfCancelled();
   }
 
   async close() {
@@ -247,10 +521,7 @@ class BrowserAuth {
     if (needsNewPage) {
       this.mailboxPage = await this.browser.newPage();
       this.mailboxBaseUrl = baseUrl;
-      await this.mailboxPage.setViewport({
-        width: this.config.browserWindowWidth,
-        height: this.config.browserWindowHeight,
-      }).catch(() => {});
+      await this.setPageViewport(this.mailboxPage);
       console.log(`[邮箱][浏览器] 打开邮箱辅助页：${baseUrl}`);
       await this.mailboxPage.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     }
@@ -323,6 +594,76 @@ class BrowserAuth {
         }
       };
 
+      const normalizeEmail = (value) => String(value || '').trim().toLowerCase();
+      const parseAccounts = (raw) => {
+        if (!raw) return [];
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) return parsed;
+          if (Array.isArray(parsed?.accounts)) return parsed.accounts;
+          if (Array.isArray(parsed?.data)) return parsed.data;
+          if (parsed && typeof parsed === 'object') return Object.values(parsed).filter((item) => item && typeof item === 'object');
+        } catch {
+          return [];
+        }
+        return [];
+      };
+      const readTokenAccounts = () => {
+        const keys = ['token_accounts_v22', 'token_accounts_v21', 'token_accounts_v20'];
+        const accounts = [];
+        for (const key of keys) {
+          const parsed = parseAccounts(localStorage.getItem(key));
+          for (const account of parsed) {
+            accounts.push({ ...account, sourceKey: key });
+          }
+        }
+        return accounts;
+      };
+      const looksLikeTokenMailboxPage = () => {
+        const title = String(document.title || '');
+        return location.pathname.includes('/token')
+          || title.includes('令牌取件')
+          || ['token_accounts_v22', 'token_accounts_v21', 'token_accounts_v20'].some((key) => Boolean(localStorage.getItem(key)));
+      };
+      const fetchTokenPageMails = async () => {
+        const accounts = readTokenAccounts();
+        const account = accounts.find((item) => normalizeEmail(item?.email) === normalizeEmail(params.email));
+        if (!account) {
+          return {
+            ok: false,
+            method: 'POST',
+            url: '/api/fetch_by_token',
+            error: `令牌取件页 localStorage 没有找到邮箱 ${params.email}，请先在该页面导入账号令牌`,
+          };
+        }
+        if (!account.client_id || !account.token) {
+          return {
+            ok: false,
+            method: 'POST',
+            url: '/api/fetch_by_token',
+            error: `令牌取件页邮箱 ${params.email} 缺少 client_id/token`,
+          };
+        }
+        const response = await fetchJson({
+          method: 'POST',
+          url: '/api/fetch_by_token',
+          data: {
+            email: account.email || params.email,
+            client_id: account.client_id,
+            token: account.token,
+            limit: params.limit,
+          },
+        });
+        if (response.ok && response.data?.status !== 'error' && Array.isArray(response.data?.emails)) {
+          return response;
+        }
+        return {
+          ...response,
+          ok: false,
+          error: response.data?.message || response.error || '令牌取件接口未返回邮件列表',
+        };
+      };
+
       const candidates = [
         { method: 'GET', url: '/admin/mails', params: { address: params.email, limit: params.limit, offset: params.offset } },
         { method: 'GET', url: '/admin/mails', params: { email: params.email, limit: params.limit, offset: params.offset } },
@@ -335,6 +676,21 @@ class BrowserAuth {
       ];
 
       const attempts = [];
+      if (looksLikeTokenMailboxPage()) {
+        const response = await fetchTokenPageMails();
+        attempts.push({
+          ok: response.ok,
+          status: response.status,
+          method: response.method,
+          url: response.url,
+          error: response.error || '',
+          textPreview: response.ok ? '' : response.textPreview,
+        });
+        if (response.ok) {
+          return { ok: true, payload: response.data, attempts };
+        }
+      }
+
       for (const candidate of candidates) {
         const response = await fetchJson(candidate);
         attempts.push({
@@ -363,8 +719,11 @@ class BrowserAuth {
     await this.keepMainPageVisible();
 
     if (!result?.ok) {
-      const lastAttempt = Array.isArray(result?.attempts) ? result.attempts[result.attempts.length - 1] : null;
-      throw new Error(`浏览器邮箱查询失败${lastAttempt?.error ? `：${lastAttempt.error}` : ''}`);
+      const attempts = Array.isArray(result?.attempts) ? result.attempts : [];
+      const tokenAttempt = attempts.find((attempt) => String(attempt?.url || '').includes('/api/fetch_by_token'));
+      const lastAttempt = attempts[attempts.length - 1] || null;
+      const usefulAttempt = tokenAttempt?.error ? tokenAttempt : lastAttempt;
+      throw new Error(`浏览器邮箱查询失败${usefulAttempt?.error ? `：${usefulAttempt.error}` : ''}`);
     }
 
     const mails = normalizeMailsFromPayload(result.payload);
@@ -378,8 +737,10 @@ class BrowserAuth {
     const maxAttempts = Number(options.maxAttempts) || 30;
     const intervalMs = Number(options.intervalMs) || 5000;
     const limit = Number(options.limit) > 0 ? Number(options.limit) : 20;
+    const signal = options.signal || this.signal;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      throwIfAborted(signal);
       console.log(`[邮箱][浏览器] 正在轮询 ${email} 的验证码 (${attempt}/${maxAttempts})`);
       try {
         const mails = await this.fetchMailsByBrowserPage(mailProvider, email, limit, 0);
@@ -397,19 +758,27 @@ class BrowserAuth {
           console.log(`[邮箱][浏览器] 已收到 ${email} 的邮件，但还没匹配到验证码${subject ? `（主题="${subject.slice(0, 80)}"）` : ''}`);
         }
       } catch (error) {
+        if (isCancelError(error)) throw error;
         console.warn(`[邮箱][浏览器] 轮询失败：${error.message}`);
       }
 
       await this.keepMainPageVisible();
-      await sleep(intervalMs);
+      await this.sleep(intervalMs, signal);
     }
 
     throw new Error(`${email} 邮箱验证码超时`);
   }
 
-  async waitForCloudflare(timeoutMs = 60000) {
+  async pollEmailCode(mailProvider, email, options = {}) {
+    console.log('[邮箱] 使用本地 Email 服务读取验证码');
+    return await pollEmailCodeByAddress(mailProvider, email, { ...options, signal: options.signal || this.signal });
+  }
+
+  async waitForCloudflare(timeoutMs = 60000, options = {}) {
+    const signal = options.signal || this.signal;
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
+      throwIfAborted(signal);
       try {
         const title = await this.page.title();
         const text = await this.page.evaluate(() => (document.body?.innerText || '').slice(0, 400)).catch(() => '');
@@ -419,30 +788,65 @@ class BrowserAuth {
       } catch {
         // Navigation can destroy the context.
       }
-      await sleep(3000);
+      await this.sleep(3000, signal);
     }
     throw new Error('Cloudflare 等待超时');
   }
 
+  async waitForCloudflareQuiet(timeoutMs = 60000, signal = this.signal) {
+    try {
+      await this.waitForCloudflare(timeoutMs, { signal });
+    } catch (error) {
+      rethrowIfCancel(error);
+    }
+  }
+
   async getPageInfo() {
-    return await this.page.evaluate(() => ({
-      url: location.href,
-      text: (document.body?.innerText || '').substring(0, 1000),
-      buttons: Array.from(document.querySelectorAll('button, a, [role="button"]'))
-        .map((node) => `${node.innerText || ''} ${node.textContent || ''} ${node.getAttribute('aria-label') || ''}`.trim())
-        .filter(Boolean),
-      inputs: Array.from(document.querySelectorAll('input:not([type="hidden"])')).map((input) => ({
-        type: input.type,
-        name: input.name,
-        placeholder: input.placeholder,
-        id: input.id,
-        autocomplete: input.autocomplete || '',
-        inputMode: input.inputMode || '',
-        maxLength: Number(input.maxLength) || 0,
-        ariaLabel: input.getAttribute('aria-label') || '',
-        visible: !!(input.offsetWidth || input.offsetHeight || input.getClientRects().length),
-      })),
-    }));
+    return await this.page.evaluate(() => {
+      const visible = (node) => {
+        if (!node) return false;
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+      };
+      const errorSelectors = [
+        '[role="alert"]',
+        '[aria-live="assertive"]',
+        '[data-testid*="error"]',
+        '.error',
+        '.text-red-500',
+        '.text-danger',
+      ];
+      const errorTexts = [];
+      for (const selector of errorSelectors) {
+        for (const node of document.querySelectorAll(selector)) {
+          const text = (node.innerText || node.textContent || '').trim();
+          if (text && visible(node)) errorTexts.push(text);
+        }
+      }
+
+      return {
+        url: location.href,
+        title: document.title || '',
+        text: (document.body?.innerText || '').substring(0, 1000),
+        errorSummary: Array.from(new Set(errorTexts)).slice(0, 5).join(' | '),
+        buttons: Array.from(document.querySelectorAll('button, a, [role="button"]'))
+          .filter((node) => visible(node))
+          .map((node) => `${node.innerText || ''} ${node.textContent || ''} ${node.getAttribute('aria-label') || ''}`.trim())
+          .filter(Boolean),
+        inputs: Array.from(document.querySelectorAll('input:not([type="hidden"])')).map((input) => ({
+          type: input.type,
+          name: input.name,
+          placeholder: input.placeholder,
+          id: input.id,
+          autocomplete: input.autocomplete || '',
+          inputMode: input.inputMode || '',
+          maxLength: Number(input.maxLength) || 0,
+          ariaLabel: input.getAttribute('aria-label') || '',
+          visible: !!(input.offsetWidth || input.offsetHeight || input.getClientRects().length),
+        })),
+      };
+    });
   }
 
   async clickByText(candidates, timeoutMs = 10000) {
@@ -467,9 +871,45 @@ class BrowserAuth {
         return false;
       }, items);
       if (clicked) return true;
-      await sleep(1000);
+      await this.sleep(1000);
     }
     return false;
+  }
+
+  async clickChooseAccountEntry(email) {
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const clickedMatched = normalizedEmail
+      ? await this.page.evaluate((expectedEmail) => {
+        const visible = (node) => {
+          if (!node) return false;
+          const style = window.getComputedStyle(node);
+          const rect = node.getBoundingClientRect();
+          return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+        };
+        const clickNode = (node) => {
+          if (typeof node.scrollIntoView === 'function') {
+            node.scrollIntoView({ block: 'center', inline: 'center' });
+          }
+          ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+            node.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+          });
+        };
+        const controls = Array.from(document.querySelectorAll('button, a, [role="button"], [tabindex]'));
+        for (const node of controls) {
+          if (!visible(node)) continue;
+          const text = `${node.innerText || ''} ${node.textContent || ''} ${node.getAttribute('aria-label') || ''}`.toLowerCase();
+          if (!text.includes(expectedEmail)) continue;
+          clickNode(node);
+          return true;
+        }
+        return false;
+      }, normalizedEmail).catch(() => false)
+      : false;
+
+    if (clickedMatched) return 'matched_email';
+
+    const clickedSwitch = await this.clickByText(ACCOUNT_SWITCH_TEXTS, 3000);
+    return clickedSwitch ? 'switch_account' : '';
   }
 
   async clickByXPath(xpath) {
@@ -546,7 +986,7 @@ class BrowserAuth {
         return;
       }
     });
-    await sleep(2500);
+    await this.sleep(2500);
   }
 
   async enterVerificationCode(code) {
@@ -658,7 +1098,7 @@ class BrowserAuth {
       }
     }
 
-    await sleep(1000);
+    await this.sleep(1000);
     await this.clickSubmitButton();
   }
 
@@ -692,11 +1132,13 @@ class BrowserAuth {
     }
   }
 
-  async authorizeWithEmailOtp({ authUrl, email, mailProvider, redirectUri }) {
+  async authorizeWithEmailOtp({ authUrl, email, mailProvider, redirectUri, signal }) {
+    const flowSignal = signal || this.signal;
+    throwIfAborted(flowSignal);
     const redirectBase = new URL(redirectUri);
     let callbackUrl = '';
     const requestListener = (request) => {
-      const reqUrl = request.url();
+      const reqUrl = getRequestUrl(request);
       try {
         const parsed = new URL(reqUrl);
         if (
@@ -712,22 +1154,32 @@ class BrowserAuth {
       }
     };
 
+    const removeAbortListener = addAbortListener(flowSignal, () => {
+      this.close().catch(() => {});
+    });
+
     this.page.on('request', requestListener);
     try {
       await this.page.goto(authUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await this.waitForCloudflare();
-      await sleep(4000);
+      throwIfAborted(flowSignal);
+      await this.waitForCloudflare(undefined, { signal: flowSignal });
+      await this.sleep(4000, flowSignal);
 
-      let lastHandledUrl = '';
-      for (let round = 0; round < 36; round += 1) {
-        await sleep(2500);
+      let lastLoggedSignature = '';
+      let timeoutErrorCount = 0;
+      const maxRounds = 60;
+
+      for (let round = 0; round < maxRounds; round += 1) {
+        throwIfAborted(flowSignal);
+        await this.sleep(1800, flowSignal);
         if (callbackUrl) return { status: 'callback', callbackUrl };
 
         let pageInfo;
         try {
           pageInfo = await this.getPageInfo();
-        } catch {
-          lastHandledUrl = '';
+        } catch (error) {
+          rethrowIfCancel(error);
+          throwIfAborted(flowSignal);
           continue;
         }
 
@@ -759,26 +1211,38 @@ class BrowserAuth {
           return { status: 'callback', callbackUrl };
         }
 
-        if (/went wrong|鍑洪敊浜唡missing_email|error/i.test(pageInfo.text)) {
-          const clickedRetry = await this.clickByText(['Retry', 'Try again', '閲嶈瘯'], 3000);
-          if (clickedRetry) {
-            lastHandledUrl = '';
-            await this.waitForCloudflare(30000).catch(() => {});
-            continue;
-          }
+        const pageType = deriveOAuthPageType(pageInfo);
+        const logSignature = `${pageType}|${pageInfo.url}|${pageInfo.errorSummary || ''}`;
+        if (logSignature !== lastLoggedSignature) {
+          const detail = pageInfo.errorSummary ? ` error="${pageInfo.errorSummary.substring(0, 120)}"` : '';
+          console.log(`[浏览器] OAuth state step[${round + 1}/${maxRounds}] page=${pageType || '-'} url=${pageInfo.url.substring(0, 110)}${detail}`);
+          lastLoggedSignature = logSignature;
         }
 
-        if (pageInfo.url === lastHandledUrl) continue;
-        console.log(`[浏览器] 第 ${round} 轮：${pageInfo.url.substring(0, 90)}`);
+        if (pageType === 'timeout_error') {
+          timeoutErrorCount += 1;
+          await this.screenshot(`oauth-timeout-${timeoutErrorCount}.png`);
+          console.warn(`[浏览器] 检测到 OpenAI 超时错误页 (${timeoutErrorCount})，关闭当前浏览器并重试`);
+          throw new OAuthBrowserRestartRequiredError('检测到 OpenAI 超时错误页，需要重启授权浏览器');
+        }
 
-        if (pageInfo.buttons.some((button) => textMatchesAny(button, EMAIL_LOGIN_TEXTS))) {
-          await this.clickByText(EMAIL_LOGIN_TEXTS, 5000);
-          lastHandledUrl = pageInfo.url;
+        if (pageType === 'choose_account') {
+          const clickedAccount = await this.clickChooseAccountEntry(email);
+          if (!clickedAccount) {
+            throw new OAuthBrowserRestartRequiredError('OAuth 账号选择页未找到匹配账号或其他账号入口');
+          }
+          console.log(`[浏览器] OAuth 账号选择页已点击：${clickedAccount}`);
+          await this.sleep(1000, flowSignal);
+          await this.waitForCloudflareQuiet(30000, flowSignal);
           continue;
         }
 
-        const hasEmailInput = pageInfo.inputs.some((input) => input.type === 'email' || ['email', 'username', 'identifier'].includes(input.name));
-        if (hasEmailInput) {
+        if (pageType === 'continue_with_email') {
+          await this.clickByText(EMAIL_LOGIN_TEXTS, 5000);
+          continue;
+        }
+
+        if (pageType === 'login_email') {
           console.log(`[浏览器] 输入邮箱：${email}`);
           await this.fillInput([
             'input[type="email"]',
@@ -788,53 +1252,50 @@ class BrowserAuth {
             'input[type="text"]',
           ], email);
           await this.page.keyboard.press('Enter').catch(() => {});
-          await sleep(1000);
+          await this.sleep(1000, flowSignal);
           await this.clickSubmitButton();
-          await this.waitForCloudflare(30000).catch(() => {});
-          lastHandledUrl = pageInfo.url;
+          await this.waitForCloudflareQuiet(30000, flowSignal);
           continue;
         }
 
-        const hasPassword = pageInfo.inputs.some((input) => input.type === 'password') || /password/i.test(pageInfo.url);
-        if (hasPassword) {
+        if (pageType === 'login_password') {
           const clickedOtp = await this.clickByXPath('/html/body/div/div/fieldset/form/div[2]/div[3]/div/button')
             || await this.clickByText(OTP_TEXTS, 5000);
           if (!clickedOtp) {
             throw new Error('密码页已显示，但未找到一次性验证码登录入口');
           }
-          await sleep(1000);
-          await this.waitForCloudflare(30000).catch(() => {});
-          lastHandledUrl = pageInfo.url;
+          await this.sleep(1000, flowSignal);
+          await this.waitForCloudflareQuiet(30000, flowSignal);
           continue;
         }
 
-        if (isCodePage(pageInfo)) {
+        if (pageType === 'email_otp_verification') {
           console.log('[浏览器] 等待邮箱验证码');
-          const code = await this.pollEmailCodeByBrowserPage(mailProvider, email, { limit: 20 });
+          const code = await this.pollEmailCode(mailProvider, email, { limit: 20, signal: flowSignal });
           await this.keepMainPageVisible();
           await this.enterVerificationCode(code);
-          await this.waitForCloudflare(30000).catch(() => {});
-          lastHandledUrl = pageInfo.url;
+          await this.waitForCloudflareQuiet(30000, flowSignal);
           continue;
         }
 
-        if (isConsentPage(pageInfo)) {
+        if (pageType === 'consent') {
           console.log('[浏览器] 点击授权确认按钮');
           const clickedConsent = await this.clickByXPath('/html/body/div/div/fieldset/form/div[2]/div/div[2]/button')
             || await this.clickByText(['Allow', 'Authorize', 'Continue', '鍏佽', '鎺堟潈', '鍚屾剰', '缁х画'], 2500);
           if (clickedConsent) {
-            await sleep(1000);
+            await this.sleep(1000, flowSignal);
             if (callbackUrl) return { status: 'callback', callbackUrl };
-            await this.waitForCloudflare(30000).catch(() => {});
+            await this.waitForCloudflareQuiet(30000, flowSignal);
             if (callbackUrl) return { status: 'callback', callbackUrl };
-            lastHandledUrl = pageInfo.url;
             continue;
           }
         }
 
         const clickedConsent = await this.clickByText(['Allow', 'Authorize', 'Continue', '鍏佽', '鎺堟潈', '鍚屾剰', '缁х画'], 2500);
         if (clickedConsent) {
-          lastHandledUrl = pageInfo.url;
+          await this.waitForCloudflareQuiet(30000, flowSignal);
+          if (callbackUrl) return { status: 'callback', callbackUrl };
+          continue;
         }
 
         if (round % 6 === 5) {
@@ -843,17 +1304,18 @@ class BrowserAuth {
         }
       }
 
-      throw new Error('OpenAI OAuth 浏览器流程超时');
+      throw new OAuthBrowserRestartRequiredError(`OpenAI OAuth 状态机 ${maxRounds} 轮内未完成，需要重启授权浏览器`);
     } finally {
-      if (typeof this.page.off === 'function') this.page.off('request', requestListener);
-      else if (typeof this.page.removeListener === 'function') this.page.removeListener('request', requestListener);
+      removeAbortListener();
+      if (this.page && typeof this.page.off === 'function') this.page.off('request', requestListener);
+      else if (this.page && typeof this.page.removeListener === 'function') this.page.removeListener('request', requestListener);
     }
   }
 
   async readChatGptSession() {
     await this.page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await this.waitForCloudflare(60000).catch(() => {});
-    await sleep(5000);
+    await this.waitForCloudflareQuiet(60000);
+    await this.sleep(5000);
 
     const result = await this.readChatGptSessionFromCurrentPage();
     if (!result.ok && !result.accessToken) {
@@ -882,7 +1344,7 @@ class BrowserAuth {
 
   async tryReadChatGptSessionFromCurrentPage() {
     try {
-      const url = new URL(this.page.url());
+      const url = new URL(getPageUrl(this.page));
       if (!/(^|\.)chatgpt\.com$/i.test(url.hostname)) return null;
       const result = await this.readChatGptSessionFromCurrentPage();
       return result?.accessToken ? result : null;
@@ -891,107 +1353,121 @@ class BrowserAuth {
     }
   }
 
-  async loginChatGptWithEmailOtp({ email, mailProvider }) {
+  async loginChatGptWithEmailOtp({ email, mailProvider, signal }) {
+    const flowSignal = signal || this.signal;
+    throwIfAborted(flowSignal);
+    const removeAbortListener = addAbortListener(flowSignal, () => {
+      this.close().catch(() => {});
+    });
+
     console.log(`[浏览器] 重新打开浏览器登录 ChatGPT：${email}`);
-    await this.page.goto('https://chatgpt.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await this.waitForCloudflare(60000).catch(() => {});
-    await sleep(3000);
+    try {
+      await this.page.goto('https://chatgpt.com/auth/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      throwIfAborted(flowSignal);
+      await this.waitForCloudflareQuiet(60000, flowSignal);
+      await this.sleep(3000, flowSignal);
 
-    let lastLoggedUrl = '';
-    let codeEntered = false;
-    for (let round = 0; round < 48; round += 1) {
-      await sleep(2500);
+      let lastLoggedUrl = '';
+      let codeEntered = false;
+      for (let round = 0; round < 48; round += 1) {
+        throwIfAborted(flowSignal);
+        await this.sleep(2500, flowSignal);
 
-      const sessionState = await this.tryReadChatGptSessionFromCurrentPage();
-      if (sessionState) {
-        console.log('[浏览器] 已获取 ChatGPT session access token');
-        return sessionState;
-      }
-
-      let pageInfo;
-      try {
-        pageInfo = await this.getPageInfo();
-      } catch {
-        continue;
-      }
-
-      if (this.isAccountDeactivatedPage(pageInfo)) {
-        await this.screenshot('chatgpt-account-deactivated.png');
-        throw new AccountDeactivatedError();
-      }
-      if (this.isAddPhonePage(pageInfo)) {
-        await this.screenshot('chatgpt-add-phone.png');
-        throw new AddPhoneRequiredError('ChatGPT 登录时要求进行手机号验证');
-      }
-
-      if (pageInfo.url !== lastLoggedUrl) {
-        console.log(`[浏览器] ChatGPT 登录第 ${round} 轮：${pageInfo.url.substring(0, 90)}`);
-        lastLoggedUrl = pageInfo.url;
-      }
-
-      const hasEmailInput = pageInfo.inputs.some((input) => input.type === 'email' || ['email', 'username', 'identifier'].includes(input.name));
-      if (hasEmailInput) {
-        console.log(`[浏览器] 输入 ChatGPT 邮箱：${email}`);
-        await this.fillInput([
-          'input[type="email"]',
-          'input[name="email"]',
-          'input[name="username"]',
-          'input[name="identifier"]',
-          'input[type="text"]',
-        ], email);
-        await this.page.keyboard.press('Enter').catch(() => {});
-        await sleep(1000);
-        await this.clickSubmitButton();
-        await this.waitForCloudflare(30000).catch(() => {});
-        continue;
-      }
-
-      const hasPassword = pageInfo.inputs.some((input) => input.type === 'password') || /password/i.test(pageInfo.url);
-      if (hasPassword) {
-        const clickedOtp = await this.clickByXPath('/html/body/div/div/fieldset/form/div[2]/div[3]/div/button')
-          || await this.clickByText(OTP_TEXTS, 5000);
-        if (!clickedOtp) {
-          throw new Error('ChatGPT 密码页已显示，但未找到一次性验证码登录入口');
+        const sessionState = await this.tryReadChatGptSessionFromCurrentPage();
+        if (sessionState) {
+          console.log('[浏览器] 已获取 ChatGPT session access token');
+          return sessionState;
         }
-        codeEntered = false;
-        await sleep(1000);
-        await this.waitForCloudflare(30000).catch(() => {});
-        continue;
+
+        let pageInfo;
+        try {
+          pageInfo = await this.getPageInfo();
+        } catch (error) {
+          rethrowIfCancel(error);
+          throwIfAborted(flowSignal);
+          continue;
+        }
+
+        if (this.isAccountDeactivatedPage(pageInfo)) {
+          await this.screenshot('chatgpt-account-deactivated.png');
+          throw new AccountDeactivatedError();
+        }
+        if (this.isAddPhonePage(pageInfo)) {
+          await this.screenshot('chatgpt-add-phone.png');
+          throw new AddPhoneRequiredError('ChatGPT 登录时要求进行手机号验证');
+        }
+
+        if (pageInfo.url !== lastLoggedUrl) {
+          console.log(`[浏览器] ChatGPT 登录第 ${round} 轮：${pageInfo.url.substring(0, 90)}`);
+          lastLoggedUrl = pageInfo.url;
+        }
+
+        const hasEmailInput = pageInfo.inputs.some((input) => input.type === 'email' || ['email', 'username', 'identifier'].includes(input.name));
+        if (hasEmailInput) {
+          console.log(`[浏览器] 输入 ChatGPT 邮箱：${email}`);
+          await this.fillInput([
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[name="username"]',
+            'input[name="identifier"]',
+            'input[type="text"]',
+          ], email);
+          await this.page.keyboard.press('Enter').catch(() => {});
+          await this.sleep(1000, flowSignal);
+          await this.clickSubmitButton();
+          await this.waitForCloudflareQuiet(30000, flowSignal);
+          continue;
+        }
+
+        const hasPassword = pageInfo.inputs.some((input) => input.type === 'password') || /password/i.test(pageInfo.url);
+        if (hasPassword) {
+          const clickedOtp = await this.clickByXPath('/html/body/div/div/fieldset/form/div[2]/div[3]/div/button')
+            || await this.clickByText(OTP_TEXTS, 5000);
+          if (!clickedOtp) {
+            throw new Error('ChatGPT 密码页已显示，但未找到一次性验证码登录入口');
+          }
+          codeEntered = false;
+          await this.sleep(1000, flowSignal);
+          await this.waitForCloudflareQuiet(30000, flowSignal);
+          continue;
+        }
+
+        if (isCodePage(pageInfo) && !codeEntered) {
+          console.log('[浏览器] 等待 ChatGPT 邮箱验证码');
+          const code = await this.pollEmailCode(mailProvider, email, { limit: 20, signal: flowSignal });
+          await this.keepMainPageVisible();
+          await this.enterVerificationCode(code);
+          await this.waitForCloudflareQuiet(30000, flowSignal);
+          codeEntered = true;
+          continue;
+        }
+
+        if (pageInfo.buttons.some((button) => textMatchesAny(button, EMAIL_LOGIN_TEXTS))) {
+          await this.clickByText(EMAIL_LOGIN_TEXTS, 5000);
+          continue;
+        }
+
+        if (pageInfo.buttons.some((button) => textMatchesAny(button, CHATGPT_LOGIN_TEXTS))) {
+          await this.clickByText(CHATGPT_LOGIN_TEXTS, 5000);
+          continue;
+        }
+
+        const clickedContinue = await this.clickByText(['Continue', '\u7ee7\u7eed'], 2000);
+        if (clickedContinue) {
+          await this.waitForCloudflareQuiet(30000, flowSignal);
+          continue;
+        }
+
+        if (round % 6 === 5) {
+          await this.screenshot(`chatgpt-login-round-${round}.png`);
+          console.log(`[浏览器] ChatGPT 登录页面内容：${pageInfo.text.substring(0, 180)}`);
+        }
       }
 
-      if (isCodePage(pageInfo) && !codeEntered) {
-        console.log('[浏览器] 等待 ChatGPT 邮箱验证码');
-        const code = await this.pollEmailCodeByBrowserPage(mailProvider, email, { limit: 20 });
-        await this.keepMainPageVisible();
-        await this.enterVerificationCode(code);
-        await this.waitForCloudflare(30000).catch(() => {});
-        codeEntered = true;
-        continue;
-      }
-
-      if (pageInfo.buttons.some((button) => textMatchesAny(button, EMAIL_LOGIN_TEXTS))) {
-        await this.clickByText(EMAIL_LOGIN_TEXTS, 5000);
-        continue;
-      }
-
-      if (pageInfo.buttons.some((button) => textMatchesAny(button, CHATGPT_LOGIN_TEXTS))) {
-        await this.clickByText(CHATGPT_LOGIN_TEXTS, 5000);
-        continue;
-      }
-
-      const clickedContinue = await this.clickByText(['Continue', '\u7ee7\u7eed'], 2000);
-      if (clickedContinue) {
-        await this.waitForCloudflare(30000).catch(() => {});
-        continue;
-      }
-
-      if (round % 6 === 5) {
-        await this.screenshot(`chatgpt-login-round-${round}.png`);
-        console.log(`[浏览器] ChatGPT 登录页面内容：${pageInfo.text.substring(0, 180)}`);
-      }
+      throw new Error('ChatGPT 重新登录并获取 access token 超时');
+    } finally {
+      removeAbortListener();
     }
-
-    throw new Error('ChatGPT 重新登录并获取 access token 超时');
   }
 }
 
@@ -999,4 +1475,5 @@ module.exports = {
   BrowserAuth,
   AddPhoneRequiredError,
   AccountDeactivatedError,
+  OAuthBrowserRestartRequiredError,
 };

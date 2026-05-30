@@ -1,3 +1,5 @@
+const { abortableSleep, isCancelError, throwIfAborted } = require('./cancel');
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function stripHtmlTags(value = '') {
@@ -20,7 +22,11 @@ function collectTextCandidates(input) {
       input?.raw,
       input?.body,
       input?.html,
+      input?.html_body,
+      input?.htmlBody,
       input?.text,
+      input?.text_body,
+      input?.textBody,
       input?.content,
       input?.subject,
       input?.title,
@@ -87,8 +93,10 @@ async function pollEmailCodeByAddress(mailProvider, email, options = {}) {
   const maxAttempts = Number(options.maxAttempts) || 30;
   const intervalMs = Number(options.intervalMs) || 5000;
   const limit = Number(options.limit) > 0 ? Number(options.limit) : 10;
+  const signal = options.signal || null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    throwIfAborted(signal);
     console.log(`[mail] polling ${email} for verification code (${attempt}/${maxAttempts})`);
     try {
       const mails = await mailProvider.getMailsByAddress(email, limit, 0);
@@ -108,9 +116,11 @@ async function pollEmailCodeByAddress(mailProvider, email, options = {}) {
         }
       }
     } catch (error) {
+      if (isCancelError(error)) throw error;
       console.warn(`[mail] polling failed: ${error.message}`);
     }
-    await sleep(intervalMs);
+    if (signal) await abortableSleep(intervalMs, signal);
+    else await sleep(intervalMs);
   }
 
   throw new Error(`${email} email code timeout`);

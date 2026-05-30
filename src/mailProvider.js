@@ -1,13 +1,34 @@
 const axios = require('axios');
 const { randomInt } = require('node:crypto');
+const { isCancelError, throwIfAborted } = require('./cancel');
+
+function normalizeBaseUrl(value) {
+  const raw = String(value || '').trim().replace(/\/+$/, '');
+  if (!raw) return '';
+
+  try {
+    const parsed = new URL(raw);
+    if (/\/token$/i.test(parsed.pathname)) {
+      parsed.pathname = '';
+      parsed.search = '';
+      parsed.hash = '';
+      return parsed.toString().replace(/\/+$/, '');
+    }
+  } catch {
+    return raw;
+  }
+
+  return raw;
+}
 
 class MailProvider {
   constructor(options) {
-    this.baseUrl = String(options.baseUrl || '').replace(/\/+$/, '');
+    this.baseUrl = normalizeBaseUrl(options.baseUrl);
     this.adminPassword = options.adminPassword;
     this.sitePassword = options.sitePassword || '';
     this.domain = options.domain;
     this.timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 45000;
+    this.signal = options.signal || null;
     this.jwt = null;
     this.address = null;
     this.addressId = null;
@@ -31,6 +52,14 @@ class MailProvider {
     };
     if (this.sitePassword) headers['x-custom-auth'] = this.sitePassword;
     return headers;
+  }
+
+  async _request(config) {
+    throwIfAborted(this.signal);
+    return axios({
+      ...config,
+      signal: this.signal || undefined,
+    });
   }
 
   _normalizeAddress(address) {
@@ -104,11 +133,13 @@ class MailProvider {
 
   async createAddress(name = null) {
     const emailName = name || this._randomName();
-    const response = await axios.post(
-      `${this.baseUrl}/admin/new_address`,
-      { name: emailName, domain: this.domain, enablePrefix: false },
-      { headers: this._adminHeaders(), timeout: this.timeoutMs }
-    );
+    const response = await this._request({
+      method: 'post',
+      url: `${this.baseUrl}/admin/new_address`,
+      data: { name: emailName, domain: this.domain, enablePrefix: false },
+      headers: this._adminHeaders(),
+      timeout: this.timeoutMs,
+    });
 
     this.jwt = response.data.jwt;
     this.address = response.data.address;
@@ -128,7 +159,9 @@ class MailProvider {
   }
 
   async getMails(limit = 10, offset = 0) {
-    const response = await axios.get(`${this.baseUrl}/api/mails`, {
+    const response = await this._request({
+      method: 'get',
+      url: `${this.baseUrl}/api/mails`,
       params: { limit, offset },
       headers: this._addressHeaders(),
       timeout: this.timeoutMs,
@@ -148,7 +181,8 @@ class MailProvider {
     try {
       const created = await this.createAddress(parts.name);
       return this._normalizeAddress(created?.address) === normalized;
-    } catch {
+    } catch (error) {
+      if (isCancelError(error)) throw error;
       return false;
     }
   }
@@ -166,7 +200,7 @@ class MailProvider {
 
     for (const candidate of candidates) {
       try {
-        const response = await axios({
+        const response = await this._request({
           method: candidate.method,
           url: `${this.baseUrl}${candidate.url}`,
           params: candidate.params,
@@ -179,7 +213,8 @@ class MailProvider {
           this.useExistingAddressSession(session);
           return true;
         }
-      } catch {
+      } catch (error) {
+        if (isCancelError(error)) throw error;
         // Try next endpoint shape.
       }
     }
@@ -223,7 +258,7 @@ class MailProvider {
     let lastError = null;
     for (const candidate of candidates) {
       try {
-        const response = await axios({
+        const response = await this._request({
           method: candidate.method,
           url: `${this.baseUrl}${candidate.url}`,
           params: candidate.params,
@@ -239,6 +274,7 @@ class MailProvider {
           return await this.getMails(limit, offset);
         }
       } catch (error) {
+        if (isCancelError(error)) throw error;
         lastError = error;
       }
     }
@@ -248,6 +284,7 @@ class MailProvider {
   }
 
   async getMailsByAddress(address, limit = 10, offset = 0) {
+    throwIfAborted(this.signal);
     const normalized = this._normalizeAddress(address);
     if (!normalized) throw new Error('email is empty');
 
@@ -262,6 +299,7 @@ class MailProvider {
       const mails = await this._fetchMailsByAdmin(normalized, limit, offset);
       if (Array.isArray(mails)) return mails;
     } catch (adminError) {
+      if (isCancelError(adminError)) throw adminError;
       // Fall through to session lookup variants. Some mailbox deployments only
       // expose mail listing through an address JWT, not directly by admin query.
     }
